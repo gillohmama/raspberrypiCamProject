@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Wigglegram Camera - Raspberry Pi 5
+Wigglegram Camera - Raspberry Pi 4
 ===================================
 Hardware:
-  - Arducam Multi Camera Adapter (4 cameras on single CSI port)
+  - Arducam Multi Camera Adapter V2.2 (4 cameras on single CSI port)
   - FREENOVE 4.3" Touchscreen (800x480)
   - PiSugar 3 Plus battery pack & button
 
 Controls:
   - Single click  (PiSugar button) : Capture all 4 cameras + create GIF
   - Double click  (PiSugar button) : Show most recent saved GIF
-  - Touch right half of screen (GIF view) : Speed up GIF (+25ms faster)
-  - Touch left  half of screen (GIF view) : Slow down GIF (+25ms slower)
+  - Touch right half of screen (GIF view) : Speed up GIF
+  - Touch left  half of screen (GIF view) : Slow down GIF
   - Keyboard +/-  : Adjust GIF frame speed
-  - Keyboard SPACE: Trigger capture (testing)
-  - Keyboard G    : Show latest GIF (testing)
+  - Keyboard SPACE: Trigger capture (testing without button)
+  - Keyboard G    : Show latest GIF  (testing without button)
   - Keyboard ESC  : Quit
 """
 
@@ -26,6 +26,7 @@ import threading
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, List
 
 import smbus2
 import pygame
@@ -63,14 +64,16 @@ GIF_FRAME_ORDER = [0, 1, 2, 3, 2, 1, 0]
 NUM_CAMERAS = 4
 
 # I2C --------------------------------------------------------
-I2C_BUS = 1                 # standard RPi I2C bus
+I2C_BUS = 1                 # standard RPi I2C bus (GPIO 2/3)
 
-# Arducam Multi Camera Adapter
-ARDUCAM_I2C_ADDR = 0x70     # default address for the mux
+# Arducam Multi Camera Adapter V2.2
+# Uses a TCA9548A-style mux — select a camera by writing a
+# SINGLE byte (the channel bitmask) with no register address.
+ARDUCAM_I2C_ADDR = 0x70
 
 # PiSugar 3 Plus
-PISUGAR_I2C_ADDR = 0x57     # PiSugar 3 / 3 Plus I2C address
-PISUGAR_BTN_REG  = 0x3A     # register holding button-tap flags
+PISUGAR_I2C_ADDR   = 0x57   # PiSugar 3 / 3 Plus I2C address
+PISUGAR_BTN_REG    = 0x3A   # register holding button-tap flags
 PISUGAR_SINGLE_BIT = 0x10   # bit 4 = single tap
 PISUGAR_DOUBLE_BIT = 0x20   # bit 5 = double tap
 
@@ -92,28 +95,36 @@ log = logging.getLogger("wigglegram")
 # ============================================================
 class ArducamAdapter:
     """
-    Controls the Arducam Multi Camera Adapter via I2C.
+    Controls the Arducam Multi Camera Adapter V2.2 via I2C.
 
-    To select camera N (0-3) it writes (1 << N) to register 0x00
-    of the I2C multiplexer at ARDUCAM_I2C_ADDR.
+    The onboard mux (TCA9548A-compatible at 0x70) selects which
+    camera is routed to the Pi's CSI port.  It expects a SINGLE
+    byte write — the channel bitmask — with no register address
+    prefix.  Using write_byte_data() (two bytes) would incorrectly
+    set the channel to 0 (all cameras off).
     """
 
-    _SELECT = [0x01, 0x02, 0x04, 0x08]  # bitmasks for cam 0-3
+    # Channel bitmasks: camera 0 → 0x01, camera 1 → 0x02, etc.
+    _SELECT = [0x01, 0x02, 0x04, 0x08]
 
     def __init__(self, bus: int = I2C_BUS, addr: int = ARDUCAM_I2C_ADDR):
-        self._bus  = smbus2.SMBus(bus)
-        self._addr = addr
+        self._bus     = smbus2.SMBus(bus)
+        self._addr    = addr
         self._current = -1
         log.info("ArducamAdapter ready  (bus=%d  addr=0x%02X)", bus, addr)
 
     def select(self, cam: int) -> None:
-        """Switch mux to camera cam (0-3). No-op if already selected."""
+        """
+        Switch mux to camera cam (0-3).
+        No-op if that camera is already selected.
+        """
         if cam == self._current:
             return
         if not 0 <= cam < NUM_CAMERAS:
-            raise ValueError(f"Camera index must be 0-{NUM_CAMERAS-1}")
+            raise ValueError(f"Camera index must be 0-{NUM_CAMERAS - 1}")
         try:
-            self._bus.write_byte_data(self._addr, 0x00, self._SELECT[cam])
+            # Single-byte write — do NOT use write_byte_data here
+            self._bus.write_byte(self._addr, self._SELECT[cam])
             time.sleep(0.05)   # let the mux settle
             self._current = cam
             log.debug("Arducam: selected camera %d", cam)
@@ -130,23 +141,44 @@ class ArducamAdapter:
 # ============================================================
 class CameraManager:
     """
-    Wraps a single Picamera2 instance that is shared across all four
-    cameras.  Between captures we stop the pipeline, switch the I2C mux,
-    then restart.
+    Wraps a single Picamera2 instance shared across all four cameras.
+
+    On Raspberry Pi 4 the IMX219 camera driver probes the sensor at
+    boot time — before the Arducam mux has been configured — so the
+    probe fails.  _rebind_driver() reloads the kernel module after
+    the mux is correctly set so that libcamera can see the sensor.
     """
 
     def __init__(self, adapter: ArducamAdapter) -> None:
         self._adapter = adapter
-        self._cam: Picamera2 | None = None
+        self._cam: Optional[Picamera2] = None
+        # Select camera 0 on the mux, then reload driver so it
+        # can probe the camera successfully this time.
+        self._adapter.select(0)
+        self._rebind_driver()
         self._open_camera(0)
 
     # ------------------------------------------------------------------
     def _open_camera(self, cam: int) -> None:
         self._close_camera()
         self._adapter.select(cam)
-        time.sleep(0.1)
+        time.sleep(0.3)   # let mux settle before picamera2 enumerates
         self._cam = Picamera2()
         log.debug("Picamera2 instance created for cam %d", cam)
+
+    @staticmethod
+    def _rebind_driver() -> None:
+        """
+        Reload the imx219 kernel module so it re-probes the camera
+        after the I2C mux has been switched.
+        NOTE: the app must be run with sudo for this to work.
+        """
+        log.info("Reloading imx219 driver…")
+        os.system("modprobe -r imx219 2>/dev/null")
+        time.sleep(0.3)
+        os.system("modprobe imx219 2>/dev/null")
+        time.sleep(0.5)
+        log.info("imx219 driver reloaded")
 
     def _close_camera(self) -> None:
         if self._cam is not None:
@@ -161,7 +193,7 @@ class CameraManager:
     # ------------------------------------------------------------------
     def capture_preview(self, cam: int) -> np.ndarray:
         """
-        Capture a single low-resolution frame for the viewfinder.
+        Capture a low-resolution frame for the viewfinder.
         Returns an HxWx3 uint8 RGB array, or a black frame on failure.
         """
         try:
@@ -181,14 +213,13 @@ class CameraManager:
 
         except Exception as exc:
             log.warning("Preview cam %d failed: %s", cam, exc)
-            # Attempt full re-init next time
             self._close_camera()
             return np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
 
-    def capture_photo(self, cam: int) -> Image.Image | None:
+    def capture_photo(self, cam: int) -> Optional[Image.Image]:
         """
         Capture a full-resolution still from camera cam.
-        Returns a PIL Image or None on failure.
+        Returns a PIL Image, or None on failure.
         """
         try:
             self._adapter.select(cam)
@@ -218,7 +249,7 @@ class CameraManager:
 #  GIF Creator
 # ============================================================
 def create_wigglegram_gif(
-    images: list[Image.Image],
+    images: List[Image.Image],
     path: str,
     frame_ms: int = GIF_SPEED_MS,
 ) -> str:
@@ -232,7 +263,7 @@ def create_wigglegram_gif(
     """
     frames = [images[i].convert("RGB") for i in GIF_FRAME_ORDER]
 
-    # Convert to palette mode (required for GIF)
+    # GIF requires palette mode
     pal_frames = [f.convert("P", palette=Image.ADAPTIVE, colors=256) for f in frames]
 
     pal_frames[0].save(
@@ -253,31 +284,31 @@ def create_wigglegram_gif(
 class PiSugarButton:
     """
     Detects single-click and double-click on the PiSugar 3 Plus
-    custom button.
+    custom button (the small button next to the power button).
 
     Strategy
     --------
-    1. Try connecting to the pisugar-server Unix socket (if the daemon
-       is running).  This is the preferred method — it handles debounce
-       and delivers clean events.
-    2. If the socket is not available, fall back to polling I2C register
-       0x3A directly.
+    1. Try the pisugar-server Unix socket first (if the daemon is
+       running).  Best option — handles debounce cleanly.
+    2. Fall back to polling I2C register 0x3A directly.
 
     Callbacks
     ---------
     Set ``on_single_click`` and ``on_double_click`` before calling
-    ``start()``.  They are invoked from a background daemon thread.
+    ``start()``.  Both are called from a background daemon thread.
     """
 
     def __init__(self) -> None:
         self.on_single_click = None
         self.on_double_click = None
         self._running = False
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True, name="pisugar-btn")
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="pisugar-btn"
+        )
         self._thread.start()
         log.info("PiSugarButton monitor started")
 
@@ -341,7 +372,10 @@ class PiSugarButton:
             log.error("Cannot open I2C bus for PiSugar: %s", exc)
             return
 
-        log.info("PiSugar: polling I2C addr=0x%02X reg=0x%02X", PISUGAR_I2C_ADDR, PISUGAR_BTN_REG)
+        log.info(
+            "PiSugar: polling I2C addr=0x%02X reg=0x%02X",
+            PISUGAR_I2C_ADDR, PISUGAR_BTN_REG,
+        )
 
         while self._running:
             try:
@@ -349,16 +383,19 @@ class PiSugarButton:
 
                 if val & PISUGAR_DOUBLE_BIT:
                     log.info("PiSugar: double-click (I2C raw=0x%02X)", val)
-                    # Clear flags
-                    bus.write_byte_data(PISUGAR_I2C_ADDR, PISUGAR_BTN_REG,
-                                        val & ~(PISUGAR_DOUBLE_BIT | PISUGAR_SINGLE_BIT))
+                    bus.write_byte_data(
+                        PISUGAR_I2C_ADDR, PISUGAR_BTN_REG,
+                        val & ~(PISUGAR_DOUBLE_BIT | PISUGAR_SINGLE_BIT),
+                    )
                     if self.on_double_click:
                         self.on_double_click()
 
                 elif val & PISUGAR_SINGLE_BIT:
                     log.info("PiSugar: single-click (I2C raw=0x%02X)", val)
-                    bus.write_byte_data(PISUGAR_I2C_ADDR, PISUGAR_BTN_REG,
-                                        val & ~PISUGAR_SINGLE_BIT)
+                    bus.write_byte_data(
+                        PISUGAR_I2C_ADDR, PISUGAR_BTN_REG,
+                        val & ~PISUGAR_SINGLE_BIT,
+                    )
                     if self.on_single_click:
                         self.on_single_click()
 
@@ -380,14 +417,14 @@ class DisplayManager:
       • PREVIEW mode  – four equal quadrants, one per camera, updated
                         sequentially by the background preview thread.
       • GIF mode      – the wigglegram GIF plays full-screen.
-      • Status overlay – short text messages faded in/out.
+      • Status overlay – short centred text messages.
     """
 
     QUAD_POSITIONS = [
-        (0,              0             ),   # cam 0  top-left
-        (DISPLAY_WIDTH // 2, 0         ),   # cam 1  top-right
-        (0,              DISPLAY_HEIGHT // 2),  # cam 2  bottom-left
-        (DISPLAY_WIDTH // 2, DISPLAY_HEIGHT // 2),  # cam 3  bottom-right
+        (0,                  0                  ),   # cam 0  top-left
+        (DISPLAY_WIDTH // 2, 0                  ),   # cam 1  top-right
+        (0,                  DISPLAY_HEIGHT // 2),   # cam 2  bottom-left
+        (DISPLAY_WIDTH // 2, DISPLAY_HEIGHT // 2),   # cam 3  bottom-right
     ]
     QUAD_SIZE = (DISPLAY_WIDTH // 2, DISPLAY_HEIGHT // 2)
 
@@ -400,18 +437,18 @@ class DisplayManager:
         pygame.display.set_caption("Wigglegram")
         pygame.mouse.set_visible(False)
 
-        self._font_sm  = pygame.font.SysFont("monospace", 16)
-        self._font_lg  = pygame.font.SysFont("monospace", 36, bold=True)
+        self._font_sm = pygame.font.SysFont("monospace", 16)
+        self._font_lg = pygame.font.SysFont("monospace", 36, bold=True)
 
-        self.mode = "preview"          # "preview" | "gif"
+        self.mode = "preview"   # "preview" | "gif"
 
-        self._preview_surfs: list[pygame.Surface | None] = [None] * NUM_CAMERAS
+        self._preview_surfs: List[Optional[pygame.Surface]] = [None] * NUM_CAMERAS
         self._preview_lock = threading.Lock()
 
-        self._gif_surfs: list[pygame.Surface] = []
-        self._gif_idx   = 0
-        self._gif_t     = 0.0
-        self.gif_speed  = GIF_SPEED_MS  # ms per frame, user-adjustable
+        self._gif_surfs: List[pygame.Surface] = []
+        self._gif_idx  = 0
+        self._gif_t    = 0.0
+        self.gif_speed = GIF_SPEED_MS   # ms per frame, user-adjustable
 
         self._status_text   = ""
         self._status_expiry = 0.0
@@ -421,9 +458,8 @@ class DisplayManager:
     # ------------------------------------------------------------------
 
     def update_preview(self, cam: int, frame: np.ndarray) -> None:
-        """Called from the preview thread. Converts array → Surface."""
+        """Called from the preview thread. Converts ndarray → Surface."""
         try:
-            # pygame expects (width, height, channels) via swapaxes
             surf = pygame.surfarray.make_surface(np.swapaxes(frame, 0, 1))
             surf = pygame.transform.scale(surf, self.QUAD_SIZE)
             with self._preview_lock:
@@ -432,9 +468,9 @@ class DisplayManager:
             log.debug("Surface update failed cam %d: %s", cam, exc)
 
     def show_gif(self, path: str) -> None:
-        """Load GIF from path and switch to gif playback mode."""
+        """Load a GIF from path and switch to gif playback mode."""
         log.info("Loading GIF: %s", path)
-        frames: list[pygame.Surface] = []
+        frames: List[pygame.Surface] = []
         try:
             gif = Image.open(path)
             while True:
@@ -494,17 +530,19 @@ class DisplayManager:
             if surfs[i]:
                 self.screen.blit(surfs[i], (x, y))
             else:
-                rect = pygame.Rect(x + 2, y + 2,
-                                   self.QUAD_SIZE[0] - 4,
-                                   self.QUAD_SIZE[1] - 4)
+                rect = pygame.Rect(
+                    x + 2, y + 2,
+                    self.QUAD_SIZE[0] - 4,
+                    self.QUAD_SIZE[1] - 4,
+                )
                 pygame.draw.rect(self.screen, (30, 30, 30), rect)
                 lbl = self._font_sm.render(f"CAM {i + 1}", True, (120, 120, 120))
                 self.screen.blit(lbl, (x + 8, y + 8))
 
-        # Grid lines
+        # Dividing grid lines
         mid_x, mid_y = DISPLAY_WIDTH // 2, DISPLAY_HEIGHT // 2
-        pygame.draw.line(self.screen, (70, 70, 70), (mid_x, 0),  (mid_x, DISPLAY_HEIGHT))
-        pygame.draw.line(self.screen, (70, 70, 70), (0, mid_y),  (DISPLAY_WIDTH, mid_y))
+        pygame.draw.line(self.screen, (70, 70, 70), (mid_x, 0), (mid_x, DISPLAY_HEIGHT))
+        pygame.draw.line(self.screen, (70, 70, 70), (0, mid_y), (DISPLAY_WIDTH, mid_y))
 
         # Speed HUD
         hud = self._font_sm.render(
@@ -521,7 +559,6 @@ class DisplayManager:
                 self._gif_t   = now
             self.screen.blit(self._gif_surfs[self._gif_idx], (0, 0))
 
-        # Speed overlay
         speed_txt = self._font_sm.render(
             f"{self.gif_speed} ms/frame  [tap L=slower  R=faster]",
             True, (220, 220, 220),
@@ -569,20 +606,19 @@ class WigglegramApp:
     """Wires together all components and runs the main event loop."""
 
     def __init__(self) -> None:
-        self._running  = False
+        self._running   = False
         self._capturing = False
 
         log.info("Initialising hardware…")
-        self._adapter  = ArducamAdapter()
-        self._cameras  = CameraManager(self._adapter)
-        self._display  = DisplayManager()
-        self._button   = PiSugarButton()
+        self._adapter = ArducamAdapter()
+        self._cameras = CameraManager(self._adapter)
+        self._display = DisplayManager()
+        self._button  = PiSugarButton()
 
         self._button.on_single_click = self._on_single_click
         self._button.on_double_click = self._on_double_click
 
-        # Track latest GIF for double-click playback
-        self._latest_gif: str | None = self._find_latest_gif()
+        self._latest_gif: Optional[str] = self._find_latest_gif()
         if self._latest_gif:
             log.info("Latest GIF on disk: %s", self._latest_gif)
 
@@ -591,7 +627,8 @@ class WigglegramApp:
     # ------------------------------------------------------------------
 
     def _on_single_click(self) -> None:
-        """Single click: capture + create GIF (or return to preview from GIF view)."""
+        """Single click: capture + create GIF.
+        If already in GIF view, return to preview instead."""
         if self._display.mode == "gif":
             self._display.show_preview()
             return
@@ -606,7 +643,6 @@ class WigglegramApp:
         """Double click: show the most recently saved GIF."""
         if self._latest_gif and os.path.exists(self._latest_gif):
             self._display.set_status("Loading…", 1.5)
-            # Run in thread so we don't block the main loop
             threading.Thread(
                 target=self._display.show_gif,
                 args=(self._latest_gif,),
@@ -622,7 +658,7 @@ class WigglegramApp:
     def _capture_sequence(self) -> None:
         """Capture 4 photos, save them, then create a wigglegram GIF."""
         self._capturing = True
-        images: list[Image.Image] = []
+        images: List[Image.Image] = []
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         try:
@@ -657,10 +693,9 @@ class WigglegramApp:
 
     def _preview_loop(self) -> None:
         """
-        Continuously cycle through cameras and push frames to the display.
-        Each camera quad is refreshed sequentially — 1 → 2 → 3 → 4 → repeat.
-        While a capture is in progress, pause so the cameras are not
-        shared between threads.
+        Continuously cycles cameras 1→2→3→4→1… capturing a preview
+        frame from each and pushing it to the display quadrant.
+        Pauses while a full capture is in progress.
         """
         cam = 0
         while self._running:
@@ -676,8 +711,12 @@ class WigglegramApp:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _find_latest_gif() -> str | None:
-        gifs = sorted(SAVE_DIR.glob("*_wigglegram.gif"), key=os.path.getmtime, reverse=True)
+    def _find_latest_gif() -> Optional[str]:
+        gifs = sorted(
+            SAVE_DIR.glob("*_wigglegram.gif"),
+            key=os.path.getmtime,
+            reverse=True,
+        )
         return str(gifs[0]) if gifs else None
 
     # ------------------------------------------------------------------
@@ -700,10 +739,8 @@ class WigglegramApp:
             while self._running:
                 for event in pygame.event.get():
                     self._handle_event(event)
-
                 self._display.draw()
                 clock.tick(30)
-
         finally:
             self._running = False
             self._shutdown()
