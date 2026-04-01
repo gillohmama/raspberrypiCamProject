@@ -133,16 +133,24 @@ class ArducamAdapter:
     ]
 
     def __init__(self, bus: int = I2C_BUS, addr: int = ARDUCAM_I2C_ADDR):
-        self._bus     = smbus2.SMBus(bus)
         self._addr    = addr
         self._current = -1
 
+        # GPIO must be configured and pre-set BEFORE opening the I2C bus —
+        # the mux chip requires OE=HIGH to respond to I2C commands.
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(False)
         GPIO.setup(self._GPIO_A,  GPIO.OUT)
         GPIO.setup(self._GPIO_B,  GPIO.OUT)
         GPIO.setup(self._GPIO_OE, GPIO.OUT)
+        # Pre-select camera 0 so OE is HIGH before the first I2C transaction
+        GPIO.output(self._GPIO_A,  GPIO.LOW)
+        GPIO.output(self._GPIO_B,  GPIO.LOW)
+        GPIO.output(self._GPIO_OE, GPIO.HIGH)
+        time.sleep(0.2)          # let the mux chip power-up/settle
 
+        # Open I2C bus only after GPIO state is stable
+        self._bus = smbus2.SMBus(bus)
         log.info("ArducamAdapter ready  (bus=%d  addr=0x%02X  GPIO 4/17/18)", bus, addr)
 
     def select(self, cam: int) -> None:
@@ -158,10 +166,11 @@ class ArducamAdapter:
             GPIO.output(self._GPIO_B,  b)
             GPIO.output(self._GPIO_OE, oe)
 
+            time.sleep(0.1)   # let GPIO state settle before I2C transaction
+
             # 2. I2C — switch the camera config signal mux (reg 0x00, value 0x04-0x07)
             self._bus.write_byte_data(self._addr, 0x00, self._SELECT_I2C[cam])
 
-            time.sleep(0.1)
             self._current = cam
             log.debug("Arducam: selected camera %d", cam)
         except OSError as exc:
