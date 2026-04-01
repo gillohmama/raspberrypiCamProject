@@ -192,44 +192,42 @@ class CameraManager:
 
     Preview strategy
     ----------------
-    The camera is kept RUNNING in video-stream mode while capturing preview
-    frames.  We only stop/reconfigure/start when we switch to a different
-    camera port.  This keeps each quadrant updating smoothly instead of
-    freezing between stop-start cycles.
+    Each call to capture_preview() does a lightweight stop → configure
+    (video mode, no raw stream) → start → grab → stop cycle.  Picamera2's
+    capture_array() internally stops the camera after each call, so we
+    track whether we need to switch the mux and only pay the full 0.5 s
+    settle cost on an actual camera change.
 
-    Cameras with no physical sensor attached are detected on first failure
-    and permanently skipped so they don't stall the preview loop.
+    Cameras with no physical sensor are detected on first failure and
+    permanently skipped so they never stall the loop again.
     """
 
     def __init__(self, adapter: ArducamAdapter) -> None:
-        self._adapter      = adapter
+        self._adapter     = adapter
         self._cam: Optional[Picamera2] = None
-        self._current_cam  = -1
-        self._preview_live = False        # True while video stream is running
-        self._failed_cams: set           = set()   # ports with no sensor
+        self._current_cam = -1
+        self._failed_cams: set = set()   # ports with no physical sensor
         self._init_camera()
 
     # ------------------------------------------------------------------
     def _init_camera(self) -> None:
-        """Create the Picamera2 instance and point mux at camera 0."""
+        """Create the Picamera2 instance and point the mux at camera 0."""
         self._adapter.select(0)
         time.sleep(0.5)
         self._cam = Picamera2()
-        self._current_cam  = 0
-        self._preview_live = False
+        self._current_cam = 0
         log.debug("Picamera2 instance created")
 
-    def _stop_stream(self) -> None:
-        """Stop the camera if it is currently streaming."""
-        if self._cam is not None and self._preview_live:
+    def _safe_stop(self) -> None:
+        if self._cam is not None:
             try:
-                self._cam.stop()
+                if self._cam.started:
+                    self._cam.stop()
             except Exception:
                 pass
-            self._preview_live = False
 
     def _close_camera(self) -> None:
-        self._stop_stream()
+        self._safe_stop()
         if self._cam is not None:
             try:
                 self._cam.close()
@@ -240,11 +238,9 @@ class CameraManager:
     # ------------------------------------------------------------------
     def capture_preview(self, cam: int) -> np.ndarray:
         """
-        Return one low-resolution RGB frame from camera *cam*.
-
-        The video stream is kept alive between calls on the same camera so
-        frames arrive quickly.  Switching cameras stops the stream, switches
-        the mux, then starts a fresh video stream on the new port.
+        Capture one low-resolution frame for the live viewfinder.
+        Uses a video configuration (no raw stream) for minimal overhead.
+        Returns an HxWx3 uint8 RGB array, or a black frame on failure.
         """
         blank = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
 
@@ -255,35 +251,35 @@ class CameraManager:
             if self._cam is None:
                 self._init_camera()
 
+            self._safe_stop()
+
+            # Switch the hardware mux only when the camera port changes
             if cam != self._current_cam:
-                # --- switch camera port ---
-                self._stop_stream()
                 self._adapter.select(cam)
-                time.sleep(0.6)          # CSI mux settle
+                time.sleep(0.5)          # CSI mux + sensor settle
                 self._current_cam = cam
 
-            if not self._preview_live:
-                # Start a video stream (low-latency, no raw buffer overhead)
-                cfg = self._cam.create_video_configuration(
-                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                          "format": "RGB888"},
-                )
-                self._cam.configure(cfg)
-                self._cam.start()
-                time.sleep(0.25)         # let AEC/AWB stabilise
-                self._preview_live = True
-
-            return self._cam.capture_array()
+            # Video config: no raw stream, low-latency, fast to start
+            cfg = self._cam.create_video_configuration(
+                main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                      "format": "RGB888"},
+            )
+            self._cam.configure(cfg)
+            self._cam.start()
+            time.sleep(0.15)             # let AEC/AWB run for a moment
+            frame = self._cam.capture_array()
+            self._cam.stop()
+            return frame
 
         except Exception as exc:
             log.warning("Preview cam %d failed: %s — marking unavailable", cam, exc)
-            self._stop_stream()
+            self._safe_stop()
             self._failed_cams.add(cam)
             return blank
 
     def stop_preview_stream(self) -> None:
-        """Call before capture_photo so the video stream is stopped first."""
-        self._stop_stream()
+        """Ensure the camera is stopped (called before capture_photo)."""
+        self._safe_stop()
 
     def capture_photo(self, cam: int) -> Optional[Image.Image]:
         """
@@ -294,28 +290,27 @@ class CameraManager:
             if self._cam is None:
                 self._init_camera()
 
-            # Stop any live preview stream before reconfiguring
-            self._stop_stream()
+            self._safe_stop()
 
             if cam != self._current_cam:
                 self._adapter.select(cam)
-                time.sleep(0.6)
+                time.sleep(0.5)
                 self._current_cam = cam
 
             cfg = self._cam.create_still_configuration(
                 main={"size": (PHOTO_WIDTH, PHOTO_HEIGHT), "format": "RGB888"},
-                raw=None,               # skip raw buffer — we only need RGB
+                raw=None,               # skip raw buffer — RGB only
             )
             self._cam.configure(cfg)
             self._cam.start()
-            time.sleep(0.5)             # let AEC/AWB settle
+            time.sleep(0.5)             # let AEC/AWB settle fully
             frame = self._cam.capture_array()
             self._cam.stop()
             return Image.fromarray(frame)
 
         except Exception as exc:
             log.error("Photo cam %d failed: %s", cam, exc)
-            self._stop_stream()
+            self._safe_stop()
             return None
 
     def close(self) -> None:
@@ -772,32 +767,25 @@ class WigglegramApp:
 
     def _preview_loop(self) -> None:
         """
-        Cycles through cameras, capturing several frames per camera before
-        switching so each quadrant updates smoothly.
-        Pauses (and stops the stream) while a full capture is in progress.
+        Continuously cycles cameras, capturing one preview frame per camera
+        per pass and updating the matching screen quadrant.
+        Pauses while a full still capture is in progress.
         """
-        FRAMES_PER_CAM = 4   # frames to grab per camera before switching
-        cam          = 0
-        frames_taken = 0
-
+        cam = 0
         while self._running:
             if self._capturing or self._display.mode == "gif":
                 self._cameras.stop_preview_stream()
-                frames_taken = 0
                 time.sleep(0.1)
                 continue
 
             frame = self._cameras.capture_preview(cam)
             self._display.update_preview(cam, frame)
-            frames_taken += 1
 
-            if frames_taken >= FRAMES_PER_CAM:
-                frames_taken = 0
-                # Advance to next camera, skipping permanently-failed ports
-                for _ in range(NUM_CAMERAS):
-                    cam = (cam + 1) % NUM_CAMERAS
-                    if cam not in self._cameras._failed_cams:
-                        break
+            # Advance to next camera, skipping any that have no sensor
+            for _ in range(NUM_CAMERAS):
+                cam = (cam + 1) % NUM_CAMERAS
+                if cam not in self._cameras._failed_cams:
+                    break
 
     # ------------------------------------------------------------------
     #  Helpers
