@@ -236,6 +236,20 @@ class CameraManager:
             self._cam = None
 
     # ------------------------------------------------------------------
+    # IMX219 I2C address (used for fast sensor-present probe)
+    _SENSOR_I2C_ADDR = 0x10
+
+    def _sensor_present(self) -> bool:
+        """
+        Quick I2C ping to check if a sensor is connected on the currently
+        selected mux channel.  Returns in ~2 ms; never hangs.
+        """
+        try:
+            self._adapter._bus.read_byte(self._SENSOR_I2C_ADDR)
+            return True
+        except OSError:
+            return False
+
     def capture_preview(self, cam: int) -> np.ndarray:
         """
         Capture one low-resolution frame for the live viewfinder.
@@ -258,6 +272,17 @@ class CameraManager:
                 self._adapter.select(cam)
                 time.sleep(0.5)          # CSI mux + sensor settle
                 self._current_cam = cam
+
+            # --- Fast sensor probe -------------------------------------------
+            # Check the I2C sensor address BEFORE starting the video stream.
+            # capture_array() blocks forever if no sensor is connected (V4L2
+            # queues frames that never arrive).  This probe returns errno 121
+            # in ~2 ms on an empty port so we can mark it failed immediately.
+            if not self._sensor_present():
+                log.info("No sensor on cam port %d — marking unavailable", cam)
+                self._failed_cams.add(cam)
+                return blank
+            # -----------------------------------------------------------------
 
             # Video config: no raw stream, low-latency, fast to start
             cfg = self._cam.create_video_configuration(
