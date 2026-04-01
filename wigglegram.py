@@ -142,23 +142,35 @@ class ArducamAdapter:
 # ============================================================
 class CameraManager:
     """
-    Wraps a single Picamera2 instance shared across all four cameras.
-    On Bullseye, simply selecting the mux channel via I2C is enough —
-    no driver rebind or modprobe needed.
+    Wraps a single persistent Picamera2 instance shared across all four
+    cameras.  On Bullseye the mux channel is switched via I2C then the
+    camera pipeline is stopped, reconfigured, and restarted — the same
+    Picamera2 object is reused to avoid the overhead and timing issues
+    of recreating it for every camera switch.
     """
 
     def __init__(self, adapter: ArducamAdapter) -> None:
-        self._adapter = adapter
+        self._adapter  = adapter
         self._cam: Optional[Picamera2] = None
-        self._open_camera(0)
+        self._current_cam = -1
+        self._init_camera()
 
     # ------------------------------------------------------------------
-    def _open_camera(self, cam: int) -> None:
-        self._close_camera()
-        self._adapter.select(cam)
-        time.sleep(0.5)   # let mux settle before picamera2 enumerates
+    def _init_camera(self) -> None:
+        """Create the Picamera2 instance once."""
+        self._adapter.select(0)
+        time.sleep(0.5)
         self._cam = Picamera2()
-        log.debug("Picamera2 instance created for cam %d", cam)
+        self._current_cam = 0
+        log.debug("Picamera2 instance created")
+
+    def _switch_camera(self, cam: int) -> None:
+        """Switch mux to cam, giving the hardware time to settle."""
+        if cam == self._current_cam:
+            return
+        self._adapter.select(cam)
+        time.sleep(0.8)   # generous settle time for CSI lane switch
+        self._current_cam = cam
 
     def _close_camera(self) -> None:
         if self._cam is not None:
@@ -177,23 +189,32 @@ class CameraManager:
         Returns an HxWx3 uint8 RGB array, or a black frame on failure.
         """
         try:
-            self._adapter.select(cam)
             if self._cam is None:
-                self._open_camera(cam)
+                self._init_camera()
+
+            self._switch_camera(cam)
+
+            if self._cam.started:
+                self._cam.stop()
 
             cfg = self._cam.create_still_configuration(
                 main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
             )
             self._cam.configure(cfg)
             self._cam.start()
-            time.sleep(0.15)
+            time.sleep(0.3)   # let sensor exposure settle
             frame = self._cam.capture_array()
             self._cam.stop()
             return frame
 
         except Exception as exc:
             log.warning("Preview cam %d failed: %s", cam, exc)
+            # Full reinit on failure
             self._close_camera()
+            try:
+                self._init_camera()
+            except Exception:
+                pass
             return np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
 
     def capture_photo(self, cam: int) -> Optional[Image.Image]:
@@ -202,16 +223,20 @@ class CameraManager:
         Returns a PIL Image, or None on failure.
         """
         try:
-            self._adapter.select(cam)
             if self._cam is None:
-                self._open_camera(cam)
+                self._init_camera()
+
+            self._switch_camera(cam)
+
+            if self._cam.started:
+                self._cam.stop()
 
             cfg = self._cam.create_still_configuration(
                 main={"size": (PHOTO_WIDTH, PHOTO_HEIGHT), "format": "RGB888"}
             )
             self._cam.configure(cfg)
             self._cam.start()
-            time.sleep(0.30)   # let AEC/AWB settle
+            time.sleep(0.5)    # let AEC/AWB settle
             frame = self._cam.capture_array()
             self._cam.stop()
             return Image.fromarray(frame)
