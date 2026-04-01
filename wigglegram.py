@@ -143,50 +143,22 @@ class ArducamAdapter:
 class CameraManager:
     """
     Wraps a single Picamera2 instance shared across all four cameras.
-
-    On Raspberry Pi 4 the IMX219 camera driver probes the sensor at
-    boot time — before the Arducam mux has been configured — so the
-    probe fails.  _rebind_driver() reloads the kernel module after
-    the mux is correctly set so that libcamera can see the sensor.
+    On Bullseye, simply selecting the mux channel via I2C is enough —
+    no driver rebind or modprobe needed.
     """
 
     def __init__(self, adapter: ArducamAdapter) -> None:
         self._adapter = adapter
         self._cam: Optional[Picamera2] = None
-        # Select camera 0 on the mux, then reload driver so it
-        # can probe the camera successfully this time.
-        self._adapter.select(0)
-        self._rebind_driver()
         self._open_camera(0)
 
     # ------------------------------------------------------------------
     def _open_camera(self, cam: int) -> None:
         self._close_camera()
         self._adapter.select(cam)
-        time.sleep(0.3)   # let mux settle before picamera2 enumerates
+        time.sleep(0.5)   # let mux settle before picamera2 enumerates
         self._cam = Picamera2()
         log.debug("Picamera2 instance created for cam %d", cam)
-
-    @staticmethod
-    def _rebind_driver() -> None:
-        """
-        Force the imx219 driver to re-probe the camera on I2C bus 10
-        after the Arducam mux has been switched.
-        The camera appears as UU at 10-0010 on boot (probe failed because
-        the mux was not yet initialised).  Unbind + rebind triggers a
-        fresh probe now that the correct camera is selected.
-        NOTE: the app must be run with sudo for this to work.
-        """
-        log.info("Rebinding imx219 driver on bus 10…")
-        os.system(
-            "echo '10-0010' | tee /sys/bus/i2c/drivers/imx219/unbind 2>/dev/null"
-        )
-        time.sleep(0.3)
-        os.system(
-            "echo '10-0010' | tee /sys/bus/i2c/drivers/imx219/bind 2>/dev/null"
-        )
-        time.sleep(0.5)
-        log.info("imx219 driver rebound")
 
     def _close_camera(self) -> None:
         if self._cam is not None:
