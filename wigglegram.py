@@ -123,7 +123,8 @@ class ArducamAdapter:
         if not 0 <= cam < NUM_CAMERAS:
             raise ValueError(f"Camera index must be 0-{NUM_CAMERAS - 1}")
         try:
-            # Single-byte write — do NOT use write_byte_data here
+            # Single-byte write — the bitmask IS the entire I2C payload
+            # Bus 10 scan confirmed camera at UU/0x10 after single-byte select
             self._bus.write_byte(self._addr, self._SELECT[cam])
             time.sleep(0.05)   # let the mux settle
             self._current = cam
@@ -169,16 +170,23 @@ class CameraManager:
     @staticmethod
     def _rebind_driver() -> None:
         """
-        Reload the imx219 kernel module so it re-probes the camera
-        after the I2C mux has been switched.
+        Force the imx219 driver to re-probe the camera on I2C bus 10
+        after the Arducam mux has been switched.
+        The camera appears as UU at 10-0010 on boot (probe failed because
+        the mux was not yet initialised).  Unbind + rebind triggers a
+        fresh probe now that the correct camera is selected.
         NOTE: the app must be run with sudo for this to work.
         """
-        log.info("Reloading imx219 driver…")
-        os.system("modprobe -r imx219 2>/dev/null")
+        log.info("Rebinding imx219 driver on bus 10…")
+        os.system(
+            "echo '10-0010' | tee /sys/bus/i2c/drivers/imx219/unbind 2>/dev/null"
+        )
         time.sleep(0.3)
-        os.system("modprobe imx219 2>/dev/null")
+        os.system(
+            "echo '10-0010' | tee /sys/bus/i2c/drivers/imx219/bind 2>/dev/null"
+        )
         time.sleep(0.5)
-        log.info("imx219 driver reloaded")
+        log.info("imx219 driver rebound")
 
     def _close_camera(self) -> None:
         if self._cam is not None:
