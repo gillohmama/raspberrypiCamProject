@@ -31,6 +31,7 @@ from typing import Optional, List
 import smbus2
 import pygame
 import numpy as np
+import RPi.GPIO as GPIO
 from PIL import Image
 from picamera2 import Picamera2
 
@@ -95,38 +96,72 @@ log = logging.getLogger("wigglegram")
 # ============================================================
 class ArducamAdapter:
     """
-    Controls the Arducam Multi Camera Adapter V2.2 via I2C.
+    Controls the Arducam Multi Camera Adapter V2.2.
 
-    The onboard mux (TCA9548A-compatible at 0x70) selects which
-    camera is routed to the Pi's CSI port.  It expects a SINGLE
-    byte write — the channel bitmask — with no register address
-    prefix.  Using write_byte_data() (two bytes) would incorrectly
-    set the channel to 0 (all cameras off).
+    Camera switching requires TWO things:
+      1. I2C mux  (addr 0x70) — routes the camera's I2C config signals
+      2. GPIO pins            — routes the actual CSI image data lanes
+
+    Without the GPIO step the camera detects and configures fine over
+    I2C but the sensor image data never reaches the Pi, causing the
+    libcamera "frontend has timed out" error.
+
+    GPIO pin mapping (BCM numbering, from AdapterTestDemo.py):
+      GPIO 4  (board pin  7) = select bit A
+      GPIO 17 (board pin 11) = select bit B
+      GPIO 27 (board pin 12) = output enable (OE)
+
+    Camera → (A, B, OE):
+      0 → LOW,  LOW,  HIGH
+      1 → HIGH, LOW,  HIGH
+      2 → LOW,  HIGH, LOW
+      3 → HIGH, HIGH, LOW
     """
 
-    # Channel bitmasks: camera 0 → 0x01, camera 1 → 0x02, etc.
-    _SELECT = [0x01, 0x02, 0x04, 0x08]
+    _SELECT_I2C = [0x01, 0x02, 0x04, 0x08]   # I2C single-byte bitmasks
+
+    _GPIO_A  = 4    # board pin 7
+    _GPIO_B  = 17   # board pin 11
+    _GPIO_OE = 18   # board pin 12  (NOT 27 — board pin 12 = BCM 18)
+
+    # (A, B, OE) for cameras 0-3
+    _GPIO_CAM = [
+        (GPIO.LOW,  GPIO.LOW,  GPIO.HIGH),
+        (GPIO.HIGH, GPIO.LOW,  GPIO.HIGH),
+        (GPIO.LOW,  GPIO.HIGH, GPIO.LOW),
+        (GPIO.HIGH, GPIO.HIGH, GPIO.LOW),
+    ]
 
     def __init__(self, bus: int = I2C_BUS, addr: int = ARDUCAM_I2C_ADDR):
         self._bus     = smbus2.SMBus(bus)
         self._addr    = addr
         self._current = -1
-        log.info("ArducamAdapter ready  (bus=%d  addr=0x%02X)", bus, addr)
+
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(self._GPIO_A,  GPIO.OUT)
+        GPIO.setup(self._GPIO_B,  GPIO.OUT)
+        GPIO.setup(self._GPIO_OE, GPIO.OUT)
+
+        log.info("ArducamAdapter ready  (bus=%d  addr=0x%02X  GPIO 4/17/18)", bus, addr)
 
     def select(self, cam: int) -> None:
-        """
-        Switch mux to camera cam (0-3).
-        No-op if that camera is already selected.
-        """
+        """Switch both the I2C mux and GPIO CSI mux to camera cam (0-3)."""
         if cam == self._current:
             return
         if not 0 <= cam < NUM_CAMERAS:
             raise ValueError(f"Camera index must be 0-{NUM_CAMERAS - 1}")
         try:
-            # Single-byte write — the bitmask IS the entire I2C payload
-            # Bus 10 scan confirmed camera at UU/0x10 after single-byte select
-            self._bus.write_byte(self._addr, self._SELECT[cam])
-            time.sleep(0.05)   # let the mux settle
+            # 1. GPIO — switch the CSI data lane mux
+            a, b, oe = self._GPIO_CAM[cam]
+            GPIO.output(self._GPIO_A,  a)
+            GPIO.output(self._GPIO_B,  b)
+            GPIO.output(self._GPIO_OE, oe)
+
+            # 2. I2C — switch the camera config signal mux
+            self._bus.write_byte(self._addr, self._SELECT_I2C[cam])
+
+            time.sleep(0.1)
             self._current = cam
             log.debug("Arducam: selected camera %d", cam)
         except OSError as exc:
@@ -135,6 +170,7 @@ class ArducamAdapter:
 
     def close(self) -> None:
         self._bus.close()
+        GPIO.cleanup()
 
 
 # ============================================================
