@@ -118,7 +118,7 @@ class ArducamAdapter:
       3 → HIGH, HIGH, LOW
     """
 
-    _SELECT_I2C = [0x01, 0x02, 0x04, 0x08]   # I2C single-byte bitmasks
+    _SELECT_I2C = [0x04, 0x05, 0x06, 0x07]   # I2C register values for cam 0-3
 
     _GPIO_A  = 4    # board pin 7
     _GPIO_B  = 17   # board pin 11
@@ -158,8 +158,8 @@ class ArducamAdapter:
             GPIO.output(self._GPIO_B,  b)
             GPIO.output(self._GPIO_OE, oe)
 
-            # 2. I2C — switch the camera config signal mux
-            self._bus.write_byte(self._addr, self._SELECT_I2C[cam])
+            # 2. I2C — switch the camera config signal mux (reg 0x00, value 0x04-0x07)
+            self._bus.write_byte_data(self._addr, 0x00, self._SELECT_I2C[cam])
 
             time.sleep(0.1)
             self._current = cam

@@ -6,7 +6,12 @@
       "WebFetch(domain:www.raspberrypi.com)",
       "WebFetch(domain:downloads.raspberrypi.com)",
       "WebFetch(domain:downloads.raspberrypi.org)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:www.arducam.com)",
+      "WebFetch(domain:docs.arducam.com)",
+      "WebFetch(domain:forum.arducam.com)",
+      "WebFetch(domain:www.timpoulsen.com)",
+      "WebFetch(domain:www.uctronics.com)"
     ]
   }
 }
