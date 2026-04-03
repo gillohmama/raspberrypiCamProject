@@ -192,21 +192,28 @@ class CameraManager:
 
     Preview strategy
     ----------------
-    Each call to capture_preview() does a lightweight stop → configure
-    (video mode, no raw stream) → start → grab → stop cycle.  Picamera2's
-    capture_array() internally stops the camera after each call, so we
-    track whether we need to switch the mux and only pay the full 0.5 s
-    settle cost on an actual camera change.
+    The camera stays in a continuous video stream.  Switching cameras only
+    requires stopping the stream, toggling the hardware mux, reconfiguring,
+    and restarting — but while on the SAME camera we just keep grabbing
+    frames with zero overhead.  The preview loop grabs several frames per
+    camera before rotating, so each quadrant gets a smooth, up-to-date
+    feed instead of a brief flash.
 
     Cameras with no physical sensor are detected on first failure and
     permanently skipped so they never stall the loop again.
     """
+
+    # How many preview frames to grab per camera before switching.
+    # Higher = smoother per-camera feed but slower round-robin refresh.
+    FRAMES_PER_CAMERA = 6
 
     def __init__(self, adapter: ArducamAdapter) -> None:
         self._adapter     = adapter
         self._cam: Optional[Picamera2] = None
         self._current_cam = -1
         self._failed_cams: set = set()   # ports with no physical sensor
+        self._streaming   = False        # True while video stream is running
+        self._stream_mode: Optional[str] = None   # "preview" or "still"
         self._init_camera()
 
     # ------------------------------------------------------------------
@@ -216,6 +223,8 @@ class CameraManager:
         time.sleep(0.5)
         self._cam = Picamera2()
         self._current_cam = 0
+        self._streaming = False
+        self._stream_mode = None
         log.debug("Picamera2 instance created")
 
     def _safe_stop(self) -> None:
@@ -225,6 +234,8 @@ class CameraManager:
                     self._cam.stop()
             except Exception:
                 pass
+        self._streaming = False
+        self._stream_mode = None
 
     def _close_camera(self) -> None:
         self._safe_stop()
@@ -250,56 +261,82 @@ class CameraManager:
         except OSError:
             return False
 
-    def capture_preview(self, cam: int) -> np.ndarray:
+    def _ensure_preview_stream(self, cam: int) -> bool:
         """
-        Capture one low-resolution frame for the live viewfinder.
-        Uses a video configuration (no raw stream) for minimal overhead.
-        Returns an HxWx3 uint8 RGB array, or a black frame on failure.
-        """
-        blank = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
+        Make sure the camera is streaming in preview (video) mode for the
+        requested camera index.  Returns True if the stream is live and
+        ready for capture_array(), False on failure.
 
+        If the camera is already streaming on the same port we do NOTHING
+        — this is the key optimisation that eliminates the per-frame
+        stop/configure/start overhead.
+        """
         if cam in self._failed_cams:
-            return blank
+            return False
 
         try:
             if self._cam is None:
                 self._init_camera()
 
-            self._safe_stop()
+            need_restart = False
 
-            # Switch the hardware mux only when the camera port changes
-            if cam != self._current_cam:
-                self._adapter.select(cam)
-                time.sleep(0.5)          # CSI mux + sensor settle
-                self._current_cam = cam
+            # If we're streaming on a different camera, or in still mode,
+            # we must stop and reconfigure.
+            if cam != self._current_cam or self._stream_mode != "preview":
+                need_restart = True
 
-            # --- Fast sensor probe -------------------------------------------
-            # Check the I2C sensor address BEFORE starting the video stream.
-            # capture_array() blocks forever if no sensor is connected (V4L2
-            # queues frames that never arrive).  This probe returns errno 121
-            # in ~2 ms on an empty port so we can mark it failed immediately.
-            if not self._sensor_present():
-                log.info("No sensor on cam port %d — marking unavailable", cam)
-                self._failed_cams.add(cam)
-                return blank
-            # -----------------------------------------------------------------
+            if need_restart:
+                self._safe_stop()
 
-            # Video config: no raw stream, low-latency, fast to start
-            cfg = self._cam.create_video_configuration(
-                main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                      "format": "RGB888"},
-            )
-            self._cam.configure(cfg)
-            self._cam.start()
-            time.sleep(0.15)             # let AEC/AWB run for a moment
-            frame = self._cam.capture_array()
-            self._cam.stop()
-            return frame
+                # Switch the hardware mux only when the camera port changes
+                if cam != self._current_cam:
+                    self._adapter.select(cam)
+                    time.sleep(0.3)          # CSI mux + sensor settle
+                    self._current_cam = cam
+
+                # Fast sensor probe before starting the stream
+                if not self._sensor_present():
+                    log.info("No sensor on cam port %d — marking unavailable", cam)
+                    self._failed_cams.add(cam)
+                    return False
+
+                # Video config: no raw stream, low-latency
+                cfg = self._cam.create_video_configuration(
+                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                          "format": "RGB888"},
+                )
+                self._cam.configure(cfg)
+                self._cam.start()
+                self._streaming = True
+                self._stream_mode = "preview"
+                # Short settle for AEC/AWB on first frame after switch
+                time.sleep(0.15)
+
+            return True
 
         except Exception as exc:
-            log.warning("Preview cam %d failed: %s — marking unavailable", cam, exc)
+            log.warning("Preview stream cam %d failed: %s — marking unavailable", cam, exc)
             self._safe_stop()
             self._failed_cams.add(cam)
+            return False
+
+    def capture_preview(self, cam: int) -> np.ndarray:
+        """
+        Capture one low-resolution frame for the live viewfinder.
+        The camera is kept streaming between calls — if we're already
+        on the same camera this is essentially free (just grab a frame).
+        Returns an HxWx3 uint8 RGB array, or a black frame on failure.
+        """
+        blank = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
+
+        if not self._ensure_preview_stream(cam):
+            return blank
+
+        try:
+            frame = self._cam.capture_array()
+            return frame
+        except Exception as exc:
+            log.warning("Preview capture cam %d failed: %s", cam, exc)
             return blank
 
     def stop_preview_stream(self) -> None:
@@ -328,9 +365,13 @@ class CameraManager:
             )
             self._cam.configure(cfg)
             self._cam.start()
+            self._streaming = True
+            self._stream_mode = "still"
             time.sleep(0.5)             # let AEC/AWB settle fully
             frame = self._cam.capture_array()
             self._cam.stop()
+            self._streaming = False
+            self._stream_mode = None
             return Image.fromarray(frame)
 
         except Exception as exc:
@@ -792,19 +833,35 @@ class WigglegramApp:
 
     def _preview_loop(self) -> None:
         """
-        Continuously cycles cameras, capturing one preview frame per camera
-        per pass and updating the matching screen quadrant.
-        Pauses while a full still capture is in progress.
+        Continuously cycles cameras, capturing multiple preview frames per
+        camera before switching to the next.  This drastically reduces
+        overhead because the expensive stop/reconfigure/start cycle only
+        happens on camera *switches*, not on every single frame.
+
+        Each quadrant's cached Surface is always visible, so even while
+        we're streaming from camera 2, cameras 0/1/3 still show their
+        most recent frame (slightly stale but never blank).
+
+        Pauses while a full still capture or GIF view is active.
         """
         cam = 0
+        frames_per_cam = CameraManager.FRAMES_PER_CAMERA
         while self._running:
             if self._capturing or self._display.mode == "gif":
                 self._cameras.stop_preview_stream()
                 time.sleep(0.1)
                 continue
 
-            frame = self._cameras.capture_preview(cam)
-            self._display.update_preview(cam, frame)
+            # Grab several frames from the current camera before rotating.
+            # The first frame after a switch pays the ~0.3 s mux cost;
+            # subsequent frames on the same camera are nearly instant.
+            for _ in range(frames_per_cam):
+                if self._capturing or self._display.mode == "gif":
+                    break
+                if not self._running:
+                    break
+                frame = self._cameras.capture_preview(cam)
+                self._display.update_preview(cam, frame)
 
             # Advance to next camera, skipping any that have no sensor
             for _ in range(NUM_CAMERAS):
