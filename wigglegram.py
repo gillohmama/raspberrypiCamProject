@@ -153,29 +153,42 @@ class ArducamAdapter:
         self._bus = smbus2.SMBus(bus)
         log.info("ArducamAdapter ready  (bus=%d  addr=0x%02X  GPIO 4/17/18)", bus, addr)
 
-    def select(self, cam: int) -> None:
-        """Switch both the I2C mux and GPIO CSI mux to camera cam (0-3)."""
+    def select(self, cam: int, retries: int = 3) -> None:
+        """Switch both the I2C mux and GPIO CSI mux to camera cam (0-3).
+
+        Retries the I2C write up to `retries` times with a short delay
+        between attempts — the mux chip can be temporarily unresponsive
+        after a V4L2 crash or power glitch.
+        """
         if cam == self._current:
             return
         if not 0 <= cam < NUM_CAMERAS:
             raise ValueError(f"Camera index must be 0-{NUM_CAMERAS - 1}")
-        try:
-            # 1. GPIO — switch the CSI data lane mux
-            a, b, oe = self._GPIO_CAM[cam]
-            GPIO.output(self._GPIO_A,  a)
-            GPIO.output(self._GPIO_B,  b)
-            GPIO.output(self._GPIO_OE, oe)
 
-            time.sleep(0.1)   # let GPIO state settle before I2C transaction
+        # 1. GPIO — switch the CSI data lane mux
+        a, b, oe = self._GPIO_CAM[cam]
+        GPIO.output(self._GPIO_A,  a)
+        GPIO.output(self._GPIO_B,  b)
+        GPIO.output(self._GPIO_OE, oe)
 
-            # 2. I2C — switch the camera config signal mux (reg 0x00, value 0x04-0x07)
-            self._bus.write_byte_data(self._addr, 0x00, self._SELECT_I2C[cam])
+        time.sleep(0.1)   # let GPIO state settle before I2C transaction
 
-            self._current = cam
-            log.debug("Arducam: selected camera %d", cam)
-        except OSError as exc:
-            log.error("Arducam I2C write failed: %s", exc)
-            raise
+        # 2. I2C — switch the camera config signal mux (with retries)
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                self._bus.write_byte_data(self._addr, 0x00, self._SELECT_I2C[cam])
+                self._current = cam
+                log.debug("Arducam: selected camera %d", cam)
+                return
+            except OSError as exc:
+                last_exc = exc
+                log.warning("Arducam I2C write attempt %d/%d failed: %s",
+                            attempt + 1, retries, exc)
+                time.sleep(0.3)
+
+        log.error("Arducam I2C write failed after %d retries", retries)
+        raise last_exc
 
     def close(self) -> None:
         self._bus.close()
@@ -220,12 +233,20 @@ class CameraManager:
 
     # ------------------------------------------------------------------
     def _init_camera(self) -> None:
-        """Create the Picamera2 instance and point the mux at camera 0."""
-        self._adapter.select(0)
-        time.sleep(0.5)
-        self._cam = Picamera2()
-        self._current_cam = 0
-        log.debug("Picamera2 instance created")
+        """Create the Picamera2 instance and point the mux at camera 0.
+        Retries up to 3 times in case the I2C bus is temporarily busy."""
+        for attempt in range(3):
+            try:
+                self._adapter.select(0)
+                time.sleep(0.5)
+                self._cam = Picamera2()
+                self._current_cam = 0
+                log.debug("Picamera2 instance created")
+                return
+            except Exception as exc:
+                log.warning("_init_camera attempt %d/3 failed: %s", attempt + 1, exc)
+                time.sleep(1.0)
+        raise RuntimeError("Failed to initialise camera after 3 attempts")
 
     def _safe_stop(self) -> None:
         if self._cam is not None:
