@@ -188,20 +188,19 @@ class ArducamAdapter:
 class CameraManager:
     """
     Wraps a single persistent Picamera2 instance shared across all four
-    cameras.
+    cameras.  The instance is created ONCE and never closed/reopened
+    (closing breaks the CSI data lane binding on the Arducam adapter).
 
     Preview strategy
     ----------------
-    The camera stays in a continuous video stream.  Switching cameras
-    requires stopping the stream, closing and reopening Picamera2 (the
-    adapter needs a fresh libcamera session per mux switch), toggling the
-    hardware mux, and restarting.  While on the SAME camera we just keep
-    grabbing frames with zero overhead.  The preview loop grabs several
-    frames per camera before rotating, so each quadrant gets a smooth,
-    up-to-date feed instead of a brief flash.
+    While on the SAME camera the video stream stays running and we just
+    grab frames — near-zero overhead.  When switching cameras we do
+    stop → mux switch → reconfigure → start (same as the original code),
+    but the preview loop grabs several frames per camera before rotating
+    so the expensive switch only happens once per batch.
 
-    No camera is ever permanently blacklisted — transient I2C or mux
-    timing issues are retried on the next round-robin pass.
+    No camera is ever permanently blacklisted — transient failures are
+    retried on the next round-robin pass.
     """
 
     # How many preview frames to grab per camera before switching.
@@ -211,20 +210,21 @@ class CameraManager:
     def __init__(self, adapter: ArducamAdapter) -> None:
         self._adapter     = adapter
         self._cam: Optional[Picamera2] = None
-        self._current_cam = 0            # ArducamAdapter.__init__ pre-selects cam 0
+        self._current_cam = -1
         self._streaming   = False        # True while video stream is running
         self._stream_mode: Optional[str] = None   # "preview" or "still"
         self._init_camera()
 
     # ------------------------------------------------------------------
     def _init_camera(self) -> None:
-        """Create the Picamera2 instance for whichever camera the mux
-        is currently pointed at."""
-        self._close_camera()
+        """Create the Picamera2 instance and point the mux at camera 0."""
+        self._adapter.select(0)
+        time.sleep(0.5)
         self._cam = Picamera2()
+        self._current_cam = 0
         self._streaming = False
         self._stream_mode = None
-        log.debug("Picamera2 instance created (cam %d)", self._current_cam)
+        log.debug("Picamera2 instance created")
 
     def _safe_stop(self) -> None:
         if self._cam is not None:
@@ -245,81 +245,55 @@ class CameraManager:
                 pass
             self._cam = None
 
-    def _switch_to_camera(self, cam: int) -> None:
-        """Full mux switch: close Picamera2, switch mux, reopen."""
-        self._close_camera()
-        self._adapter.select(cam)
-        time.sleep(0.5)          # CSI mux + sensor settle
-        self._current_cam = cam
-        self._cam = Picamera2()
-        self._streaming = False
-        self._stream_mode = None
-        log.debug("Switched to camera %d (full reinit)", cam)
-
     # ------------------------------------------------------------------
-    def _ensure_preview_stream(self, cam: int) -> bool:
-        """
-        Make sure the camera is streaming in preview (video) mode for the
-        requested camera index.  Returns True if the stream is live and
-        ready for capture_array(), False on failure.
-
-        If the camera is already streaming on the same port we do NOTHING
-        — this is the key optimisation that eliminates the per-frame
-        stop/configure/start overhead.
-        """
-        try:
-            need_restart = False
-
-            # If we need a different camera or we're in still mode,
-            # we must switch and reconfigure.
-            if cam != self._current_cam or self._stream_mode != "preview":
-                need_restart = True
-
-            if need_restart:
-                # Full close/reopen when switching cameras — the Arducam
-                # adapter needs a fresh libcamera session after mux toggle.
-                if cam != self._current_cam or self._cam is None:
-                    self._switch_to_camera(cam)
-                else:
-                    # Same camera, just need to reconfigure (e.g. still→preview)
-                    self._safe_stop()
-
-                # Video config: no raw stream, low-latency
-                cfg = self._cam.create_video_configuration(
-                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                          "format": "RGB888"},
-                )
-                self._cam.configure(cfg)
-                self._cam.start()
-                self._streaming = True
-                self._stream_mode = "preview"
-                # Short settle for AEC/AWB on first frame after switch
-                time.sleep(0.15)
-
-            return True
-
-        except Exception as exc:
-            log.warning("Preview stream cam %d failed: %s (will retry next pass)", cam, exc)
-            self._safe_stop()
-            return False
-
     def capture_preview(self, cam: int) -> np.ndarray:
         """
         Capture one low-resolution frame for the live viewfinder.
-        The camera is kept streaming between calls — if we're already
-        on the same camera this is essentially free (just grab a frame).
+
+        If we're already streaming on the same camera, just grabs the
+        next frame (near-instant).  If we need to switch cameras, does
+        a full stop → mux switch → reconfigure → start cycle.
+
         Returns an HxWx3 uint8 RGB array, or a black frame on failure.
         """
         blank = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
 
-        if not self._ensure_preview_stream(cam):
-            return blank
-
         try:
+            if self._cam is None:
+                self._init_camera()
+
+            # Already streaming preview on this camera — just grab a frame
+            if (cam == self._current_cam
+                    and self._streaming
+                    and self._stream_mode == "preview"):
+                frame = self._cam.capture_array()
+                return frame
+
+            # Need to (re)start: either different camera or not streaming
+            self._safe_stop()
+
+            # Switch the hardware mux if camera changed
+            if cam != self._current_cam:
+                self._adapter.select(cam)
+                time.sleep(0.5)          # CSI mux + sensor settle
+                self._current_cam = cam
+
+            # Video config: no raw stream, low-latency, fast to start
+            cfg = self._cam.create_video_configuration(
+                main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                      "format": "RGB888"},
+            )
+            self._cam.configure(cfg)
+            self._cam.start()
+            self._streaming = True
+            self._stream_mode = "preview"
+            time.sleep(0.15)             # let AEC/AWB run for a moment
             frame = self._cam.capture_array()
             return frame
+
         except Exception as exc:
-            log.warning("Preview capture cam %d failed: %s", cam, exc)
+            log.warning("Preview cam %d failed: %s (will retry next pass)", cam, exc)
+            self._safe_stop()
             return blank
 
     def stop_preview_stream(self) -> None:
@@ -332,11 +306,15 @@ class CameraManager:
         Returns a PIL Image, or None on failure.
         """
         try:
-            # Full close/reopen for camera switch
-            if cam != self._current_cam or self._cam is None:
-                self._switch_to_camera(cam)
-            else:
-                self._safe_stop()
+            if self._cam is None:
+                self._init_camera()
+
+            self._safe_stop()
+
+            if cam != self._current_cam:
+                self._adapter.select(cam)
+                time.sleep(0.5)
+                self._current_cam = cam
 
             cfg = self._cam.create_still_configuration(
                 main={"size": (PHOTO_WIDTH, PHOTO_HEIGHT), "format": "RGB888"},
