@@ -187,15 +187,19 @@ class ArducamAdapter:
 # ============================================================
 class CameraManager:
     """
-    Wraps a single persistent Picamera2 instance shared across all four
-    cameras.  The instance is created ONCE and never closed/reopened
-    (closing breaks the CSI data lane binding on the Arducam adapter).
+    Wraps a Picamera2 instance shared across all four cameras via the
+    Arducam mux.
 
     Preview strategy
     ----------------
     Each capture_preview() does configure → start → capture → stop,
-    exactly like the original working code.  The only changes are
-    reduced settle times and a capture timeout to prevent hangs.
+    exactly like the original working code.  Reduced settle times make
+    the cycle faster.
+
+    A capture timeout prevents bad camera ports from hanging the loop.
+    After a V4L2-level failure the Picamera2 instance is fully closed
+    and re-opened (on a known-good camera) to reset the driver state.
+    Failed ports are temporarily skipped to keep the cycle smooth.
     """
 
     # Timeout (seconds) for capture_array — if a camera port is dead
@@ -240,6 +244,34 @@ class CameraManager:
                 pass
             self._cam = None
 
+    def _recover_camera(self) -> None:
+        """
+        Nuclear recovery: close Picamera2 completely and reopen it on
+        camera 0 (known-good).  This resets the V4L2 driver state after
+        a bad camera port corrupts the buffer queues.
+        """
+        log.warning("Recovering camera — full close/reopen on cam 0")
+        try:
+            if self._cam is not None:
+                try:
+                    self._cam.stop()
+                except Exception:
+                    pass
+                try:
+                    self._cam.close()
+                except Exception:
+                    pass
+                self._cam = None
+        except Exception:
+            self._cam = None
+
+        # Switch mux to camera 0 BEFORE creating new Picamera2
+        self._adapter.select(0)
+        time.sleep(0.5)
+        self._cam = Picamera2()
+        self._current_cam = 0
+        log.info("Camera recovered successfully")
+
     # ------------------------------------------------------------------
     def _capture_with_timeout(self, timeout: float = 2.0) -> Optional[np.ndarray]:
         """
@@ -278,10 +310,10 @@ class CameraManager:
         """
         blank = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
 
-        # Skip cameras that have failed many times in a row — but still
-        # retry every 10th pass so they can recover.
+        # Skip cameras that have failed recently — retry every 30th pass
+        # (about every 30 seconds) so they can recover if reconnected.
         fail_n = self._fail_count.get(cam, 0)
-        if fail_n >= 3 and fail_n % 10 != 0:
+        if fail_n >= 2 and fail_n % 30 != 0:
             return blank
 
         try:
@@ -316,8 +348,9 @@ class CameraManager:
 
         except Exception as exc:
             log.warning("Preview cam %d failed: %s", cam, exc)
-            self._safe_stop()
             self._fail_count[cam] = self._fail_count.get(cam, 0) + 1
+            # V4L2 errors corrupt driver state — full recovery needed
+            self._recover_camera()
             return blank
 
     def stop_preview_stream(self) -> None:
@@ -357,7 +390,7 @@ class CameraManager:
 
         except Exception as exc:
             log.error("Photo cam %d failed: %s", cam, exc)
-            self._safe_stop()
+            self._recover_camera()
             return None
 
     def close(self) -> None:
