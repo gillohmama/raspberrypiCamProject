@@ -192,15 +192,16 @@ class CameraManager:
 
     Preview strategy
     ----------------
-    The camera stays in a continuous video stream.  Switching cameras only
-    requires stopping the stream, toggling the hardware mux, reconfiguring,
-    and restarting — but while on the SAME camera we just keep grabbing
-    frames with zero overhead.  The preview loop grabs several frames per
-    camera before rotating, so each quadrant gets a smooth, up-to-date
-    feed instead of a brief flash.
+    The camera stays in a continuous video stream.  Switching cameras
+    requires stopping the stream, closing and reopening Picamera2 (the
+    adapter needs a fresh libcamera session per mux switch), toggling the
+    hardware mux, and restarting.  While on the SAME camera we just keep
+    grabbing frames with zero overhead.  The preview loop grabs several
+    frames per camera before rotating, so each quadrant gets a smooth,
+    up-to-date feed instead of a brief flash.
 
-    Cameras with no physical sensor are detected on first failure and
-    permanently skipped so they never stall the loop again.
+    No camera is ever permanently blacklisted — transient I2C or mux
+    timing issues are retried on the next round-robin pass.
     """
 
     # How many preview frames to grab per camera before switching.
@@ -210,22 +211,20 @@ class CameraManager:
     def __init__(self, adapter: ArducamAdapter) -> None:
         self._adapter     = adapter
         self._cam: Optional[Picamera2] = None
-        self._current_cam = -1
-        self._failed_cams: set = set()   # ports with no physical sensor
+        self._current_cam = 0            # ArducamAdapter.__init__ pre-selects cam 0
         self._streaming   = False        # True while video stream is running
         self._stream_mode: Optional[str] = None   # "preview" or "still"
         self._init_camera()
 
     # ------------------------------------------------------------------
     def _init_camera(self) -> None:
-        """Create the Picamera2 instance and point the mux at camera 0."""
-        self._adapter.select(0)
-        time.sleep(0.5)
+        """Create the Picamera2 instance for whichever camera the mux
+        is currently pointed at."""
+        self._close_camera()
         self._cam = Picamera2()
-        self._current_cam = 0
         self._streaming = False
         self._stream_mode = None
-        log.debug("Picamera2 instance created")
+        log.debug("Picamera2 instance created (cam %d)", self._current_cam)
 
     def _safe_stop(self) -> None:
         if self._cam is not None:
@@ -246,21 +245,18 @@ class CameraManager:
                 pass
             self._cam = None
 
+    def _switch_to_camera(self, cam: int) -> None:
+        """Full mux switch: close Picamera2, switch mux, reopen."""
+        self._close_camera()
+        self._adapter.select(cam)
+        time.sleep(0.5)          # CSI mux + sensor settle
+        self._current_cam = cam
+        self._cam = Picamera2()
+        self._streaming = False
+        self._stream_mode = None
+        log.debug("Switched to camera %d (full reinit)", cam)
+
     # ------------------------------------------------------------------
-    # IMX219 I2C address (used for fast sensor-present probe)
-    _SENSOR_I2C_ADDR = 0x10
-
-    def _sensor_present(self) -> bool:
-        """
-        Quick I2C ping to check if a sensor is connected on the currently
-        selected mux channel.  Returns in ~2 ms; never hangs.
-        """
-        try:
-            self._adapter._bus.read_byte(self._SENSOR_I2C_ADDR)
-            return True
-        except OSError:
-            return False
-
     def _ensure_preview_stream(self, cam: int) -> bool:
         """
         Make sure the camera is streaming in preview (video) mode for the
@@ -271,34 +267,22 @@ class CameraManager:
         — this is the key optimisation that eliminates the per-frame
         stop/configure/start overhead.
         """
-        if cam in self._failed_cams:
-            return False
-
         try:
-            if self._cam is None:
-                self._init_camera()
-
             need_restart = False
 
-            # If we're streaming on a different camera, or in still mode,
-            # we must stop and reconfigure.
+            # If we need a different camera or we're in still mode,
+            # we must switch and reconfigure.
             if cam != self._current_cam or self._stream_mode != "preview":
                 need_restart = True
 
             if need_restart:
-                self._safe_stop()
-
-                # Switch the hardware mux only when the camera port changes
-                if cam != self._current_cam:
-                    self._adapter.select(cam)
-                    time.sleep(0.3)          # CSI mux + sensor settle
-                    self._current_cam = cam
-
-                # Fast sensor probe before starting the stream
-                if not self._sensor_present():
-                    log.info("No sensor on cam port %d — marking unavailable", cam)
-                    self._failed_cams.add(cam)
-                    return False
+                # Full close/reopen when switching cameras — the Arducam
+                # adapter needs a fresh libcamera session after mux toggle.
+                if cam != self._current_cam or self._cam is None:
+                    self._switch_to_camera(cam)
+                else:
+                    # Same camera, just need to reconfigure (e.g. still→preview)
+                    self._safe_stop()
 
                 # Video config: no raw stream, low-latency
                 cfg = self._cam.create_video_configuration(
@@ -315,9 +299,8 @@ class CameraManager:
             return True
 
         except Exception as exc:
-            log.warning("Preview stream cam %d failed: %s — marking unavailable", cam, exc)
+            log.warning("Preview stream cam %d failed: %s (will retry next pass)", cam, exc)
             self._safe_stop()
-            self._failed_cams.add(cam)
             return False
 
     def capture_preview(self, cam: int) -> np.ndarray:
@@ -349,15 +332,11 @@ class CameraManager:
         Returns a PIL Image, or None on failure.
         """
         try:
-            if self._cam is None:
-                self._init_camera()
-
-            self._safe_stop()
-
-            if cam != self._current_cam:
-                self._adapter.select(cam)
-                time.sleep(0.5)
-                self._current_cam = cam
+            # Full close/reopen for camera switch
+            if cam != self._current_cam or self._cam is None:
+                self._switch_to_camera(cam)
+            else:
+                self._safe_stop()
 
             cfg = self._cam.create_still_configuration(
                 main={"size": (PHOTO_WIDTH, PHOTO_HEIGHT), "format": "RGB888"},
@@ -863,11 +842,8 @@ class WigglegramApp:
                 frame = self._cameras.capture_preview(cam)
                 self._display.update_preview(cam, frame)
 
-            # Advance to next camera, skipping any that have no sensor
-            for _ in range(NUM_CAMERAS):
-                cam = (cam + 1) % NUM_CAMERAS
-                if cam not in self._cameras._failed_cams:
-                    break
+            # Advance to next camera
+            cam = (cam + 1) % NUM_CAMERAS
 
     # ------------------------------------------------------------------
     #  Helpers
