@@ -193,26 +193,30 @@ class CameraManager:
 
     Preview strategy
     ----------------
-    While on the SAME camera the video stream stays running and we just
-    grab frames — near-zero overhead.  When switching cameras we do
-    stop → mux switch → reconfigure → start (same as the original code),
-    but the preview loop grabs several frames per camera before rotating
-    so the expensive switch only happens once per batch.
+    Every capture_preview() call does start → capture → stop (safe).
+    The optimisation: when staying on the SAME camera we skip the
+    expensive configure() step because Picamera2 remembers the config
+    after stop().  Combined with the preview loop grabbing multiple
+    frames per camera, the configure + mux-switch cost is paid only
+    once per camera per batch.
 
-    No camera is ever permanently blacklisted — transient failures are
-    retried on the next round-robin pass.
+    capture_array() is wrapped in a thread with a timeout so a bad
+    camera port can never hang the preview loop.
     """
 
     # How many preview frames to grab per camera before switching.
-    # Higher = smoother per-camera feed but slower round-robin refresh.
-    FRAMES_PER_CAMERA = 6
+    FRAMES_PER_CAMERA = 3
+
+    # Timeout (seconds) for capture_array — if a camera port is dead
+    # (e.g. no sensor, V4L2 buffer errors) we bail out quickly.
+    CAPTURE_TIMEOUT = 2.0
 
     def __init__(self, adapter: ArducamAdapter) -> None:
         self._adapter     = adapter
         self._cam: Optional[Picamera2] = None
         self._current_cam = -1
-        self._streaming   = False        # True while video stream is running
-        self._stream_mode: Optional[str] = None   # "preview" or "still"
+        self._last_preview_cam = -1    # last cam we configured for preview
+        self._fail_count: dict = {}    # cam → consecutive failure count
         self._init_camera()
 
     # ------------------------------------------------------------------
@@ -222,8 +226,7 @@ class CameraManager:
         time.sleep(0.5)
         self._cam = Picamera2()
         self._current_cam = 0
-        self._streaming = False
-        self._stream_mode = None
+        self._last_preview_cam = -1
         log.debug("Picamera2 instance created")
 
     def _safe_stop(self) -> None:
@@ -233,8 +236,6 @@ class CameraManager:
                     self._cam.stop()
             except Exception:
                 pass
-        self._streaming = False
-        self._stream_mode = None
 
     def _close_camera(self) -> None:
         self._safe_stop()
@@ -246,54 +247,94 @@ class CameraManager:
             self._cam = None
 
     # ------------------------------------------------------------------
+    def _capture_with_timeout(self, timeout: float = 2.0) -> Optional[np.ndarray]:
+        """
+        Call capture_array() with a timeout.  Returns the frame, or
+        None if the call hangs or throws.
+        """
+        import queue as _queue
+        result_q: _queue.Queue = _queue.Queue()
+
+        def _grab():
+            try:
+                frame = self._cam.capture_array()
+                result_q.put(frame)
+            except Exception:
+                result_q.put(None)
+
+        t = threading.Thread(target=_grab, daemon=True)
+        t.start()
+        t.join(timeout)
+
+        if result_q.empty():
+            log.warning("capture_array() timed out after %.1fs", timeout)
+            return None
+
+        return result_q.get_nowait()
+
+    # ------------------------------------------------------------------
     def capture_preview(self, cam: int) -> np.ndarray:
         """
         Capture one low-resolution frame for the live viewfinder.
 
-        If we're already streaming on the same camera, just grabs the
-        next frame (near-instant).  If we need to switch cameras, does
-        a full stop → mux switch → reconfigure → start cycle.
+        Always does start → capture → stop for safety (prevents V4L2
+        buffer corruption across mux switches).  Skips configure() when
+        re-using the same camera port.
 
         Returns an HxWx3 uint8 RGB array, or a black frame on failure.
         """
         blank = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
 
+        # Skip cameras that have failed many times in a row — but still
+        # retry every 10th pass so they can recover.
+        fail_n = self._fail_count.get(cam, 0)
+        if fail_n >= 3 and fail_n % 10 != 0:
+            return blank
+
         try:
             if self._cam is None:
                 self._init_camera()
 
-            # Already streaming preview on this camera — just grab a frame
-            if (cam == self._current_cam
-                    and self._streaming
-                    and self._stream_mode == "preview"):
-                frame = self._cam.capture_array()
-                return frame
-
-            # Need to (re)start: either different camera or not streaming
             self._safe_stop()
 
             # Switch the hardware mux if camera changed
             if cam != self._current_cam:
                 self._adapter.select(cam)
-                time.sleep(0.5)          # CSI mux + sensor settle
+                time.sleep(0.3)          # CSI mux settle (preview)
                 self._current_cam = cam
 
-            # Video config: no raw stream, low-latency, fast to start
-            cfg = self._cam.create_video_configuration(
-                main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                      "format": "RGB888"},
-            )
-            self._cam.configure(cfg)
+            # Only run configure() when switching to a different camera
+            # or first time.  Picamera2 keeps the config after stop().
+            if cam != self._last_preview_cam:
+                cfg = self._cam.create_video_configuration(
+                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                          "format": "RGB888"},
+                )
+                self._cam.configure(cfg)
+                self._last_preview_cam = cam
+
             self._cam.start()
-            self._streaming = True
-            self._stream_mode = "preview"
-            time.sleep(0.15)             # let AEC/AWB run for a moment
-            frame = self._cam.capture_array()
+
+            # First frame after mux switch needs more AEC/AWB settle time
+            if fail_n == 0 and cam == self._current_cam:
+                time.sleep(0.05)
+            else:
+                time.sleep(0.15)
+
+            frame = self._capture_with_timeout(self.CAPTURE_TIMEOUT)
+            self._cam.stop()
+
+            if frame is None:
+                raise RuntimeError("capture timed out")
+
+            # Success — reset failure counter
+            self._fail_count[cam] = 0
             return frame
 
         except Exception as exc:
-            log.warning("Preview cam %d failed: %s (will retry next pass)", cam, exc)
+            log.warning("Preview cam %d failed: %s", cam, exc)
             self._safe_stop()
+            self._fail_count[cam] = self._fail_count.get(cam, 0) + 1
             return blank
 
     def stop_preview_stream(self) -> None:
@@ -321,14 +362,15 @@ class CameraManager:
                 raw=None,               # skip raw buffer — RGB only
             )
             self._cam.configure(cfg)
+            self._last_preview_cam = -1   # force re-configure on next preview
             self._cam.start()
-            self._streaming = True
-            self._stream_mode = "still"
             time.sleep(0.5)             # let AEC/AWB settle fully
-            frame = self._cam.capture_array()
+            frame = self._capture_with_timeout(5.0)
             self._cam.stop()
-            self._streaming = False
-            self._stream_mode = None
+
+            if frame is None:
+                raise RuntimeError("capture timed out")
+
             return Image.fromarray(frame)
 
         except Exception as exc:
@@ -810,15 +852,19 @@ class WigglegramApp:
                 continue
 
             # Grab several frames from the current camera before rotating.
-            # The first frame after a switch pays the ~0.3 s mux cost;
-            # subsequent frames on the same camera are nearly instant.
-            for _ in range(frames_per_cam):
+            # First frame pays the mux switch + configure cost (~0.5 s);
+            # subsequent frames skip configure (just start/capture/stop).
+            for i in range(frames_per_cam):
                 if self._capturing or self._display.mode == "gif":
                     break
                 if not self._running:
                     break
                 frame = self._cameras.capture_preview(cam)
                 self._display.update_preview(cam, frame)
+                # If first frame failed (blank), don't waste time on
+                # more frames from this camera — move on.
+                if i == 0 and not frame.any():
+                    break
 
             # Advance to next camera
             cam = (cam + 1) % NUM_CAMERAS
