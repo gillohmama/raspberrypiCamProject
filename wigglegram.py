@@ -193,29 +193,24 @@ class CameraManager:
 
     Preview strategy
     ----------------
-    Every capture_preview() call does start → capture → stop (safe).
-    The optimisation: when staying on the SAME camera we skip the
-    expensive configure() step because Picamera2 remembers the config
-    after stop().  Combined with the preview loop grabbing multiple
-    frames per camera, the configure + mux-switch cost is paid only
-    once per camera per batch.
-
-    capture_array() is wrapped in a thread with a timeout so a bad
-    camera port can never hang the preview loop.
+    Each capture_preview() does configure → start → capture → stop,
+    exactly like the original working code.  The only changes are
+    reduced settle times and a capture timeout to prevent hangs.
     """
-
-    # How many preview frames to grab per camera before switching.
-    FRAMES_PER_CAMERA = 3
 
     # Timeout (seconds) for capture_array — if a camera port is dead
     # (e.g. no sensor, V4L2 buffer errors) we bail out quickly.
     CAPTURE_TIMEOUT = 2.0
 
+    # Settle times (seconds) — tune these if cameras show artefacts.
+    # Lower = faster cycle but more risk of bad frames.
+    MUX_SETTLE   = 0.2     # after switching the hardware mux (was 0.5)
+    AEC_SETTLE   = 0.08    # after starting stream, let auto-exposure adjust (was 0.15)
+
     def __init__(self, adapter: ArducamAdapter) -> None:
         self._adapter     = adapter
         self._cam: Optional[Picamera2] = None
         self._current_cam = -1
-        self._last_preview_cam = -1    # last cam we configured for preview
         self._fail_count: dict = {}    # cam → consecutive failure count
         self._init_camera()
 
@@ -226,7 +221,6 @@ class CameraManager:
         time.sleep(0.5)
         self._cam = Picamera2()
         self._current_cam = 0
-        self._last_preview_cam = -1
         log.debug("Picamera2 instance created")
 
     def _safe_stop(self) -> None:
@@ -277,9 +271,8 @@ class CameraManager:
         """
         Capture one low-resolution frame for the live viewfinder.
 
-        Always does start → capture → stop for safety (prevents V4L2
-        buffer corruption across mux switches).  Skips configure() when
-        re-using the same camera port.
+        Full configure → start → capture → stop every time (required
+        by V4L2 driver to avoid buffer corruption).
 
         Returns an HxWx3 uint8 RGB array, or a black frame on failure.
         """
@@ -300,27 +293,17 @@ class CameraManager:
             # Switch the hardware mux if camera changed
             if cam != self._current_cam:
                 self._adapter.select(cam)
-                time.sleep(0.3)          # CSI mux settle (preview)
+                time.sleep(self.MUX_SETTLE)
                 self._current_cam = cam
 
-            # Only run configure() when switching to a different camera
-            # or first time.  Picamera2 keeps the config after stop().
-            if cam != self._last_preview_cam:
-                cfg = self._cam.create_video_configuration(
-                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                          "format": "RGB888"},
-                )
-                self._cam.configure(cfg)
-                self._last_preview_cam = cam
-
+            # Full configure → start → capture → stop (safest approach)
+            cfg = self._cam.create_video_configuration(
+                main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                      "format": "RGB888"},
+            )
+            self._cam.configure(cfg)
             self._cam.start()
-
-            # First frame after mux switch needs more AEC/AWB settle time
-            if fail_n == 0 and cam == self._current_cam:
-                time.sleep(0.05)
-            else:
-                time.sleep(0.15)
-
+            time.sleep(self.AEC_SETTLE)
             frame = self._capture_with_timeout(self.CAPTURE_TIMEOUT)
             self._cam.stop()
 
@@ -362,7 +345,6 @@ class CameraManager:
                 raw=None,               # skip raw buffer — RGB only
             )
             self._cam.configure(cfg)
-            self._last_preview_cam = -1   # force re-configure on next preview
             self._cam.start()
             time.sleep(0.5)             # let AEC/AWB settle fully
             frame = self._capture_with_timeout(5.0)
@@ -844,27 +826,14 @@ class WigglegramApp:
         Pauses while a full still capture or GIF view is active.
         """
         cam = 0
-        frames_per_cam = CameraManager.FRAMES_PER_CAMERA
         while self._running:
             if self._capturing or self._display.mode == "gif":
                 self._cameras.stop_preview_stream()
                 time.sleep(0.1)
                 continue
 
-            # Grab several frames from the current camera before rotating.
-            # First frame pays the mux switch + configure cost (~0.5 s);
-            # subsequent frames skip configure (just start/capture/stop).
-            for i in range(frames_per_cam):
-                if self._capturing or self._display.mode == "gif":
-                    break
-                if not self._running:
-                    break
-                frame = self._cameras.capture_preview(cam)
-                self._display.update_preview(cam, frame)
-                # If first frame failed (blank), don't waste time on
-                # more frames from this camera — move on.
-                if i == 0 and not frame.any():
-                    break
+            frame = self._cameras.capture_preview(cam)
+            self._display.update_preview(cam, frame)
 
             # Advance to next camera
             cam = (cam + 1) % NUM_CAMERAS
