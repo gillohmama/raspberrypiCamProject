@@ -7,8 +7,13 @@ Hardware:
   - FREENOVE 4.3" Touchscreen (800x480)
   - PiSugar 3 Plus battery pack & button
 
+Usage:
+  sudo python3 wigglegram.py        # 4 cameras (default)
+  sudo python3 wigglegram.py 3      # 3 cameras on ports A+B+C
+  sudo python3 wigglegram.py 2      # 2 cameras on ports A+B
+
 Controls:
-  - Single click  (PiSugar button) : Capture all 4 cameras + create GIF
+  - Single click  (PiSugar button) : Capture all cameras + create GIF
   - Double click  (PiSugar button) : Show most recent saved GIF
   - Touch right half of screen (GIF view) : Speed up GIF
   - Touch left  half of screen (GIF view) : Slow down GIF
@@ -59,10 +64,23 @@ GIF_SPEED_MIN  = 40    # fastest allowed
 GIF_SPEED_MAX  = 1000  # slowest allowed
 GIF_SPEED_STEP = 25    # how much each +/- press changes it
 
-# Frame order for the wigglegram bounce: 1,2,3,4,3,2,1 (0-indexed)
-GIF_FRAME_ORDER = [0, 1, 2, 3, 2, 1, 0]
-
+# How many cameras are attached (2, 3 or 4).  Cameras must occupy the
+# adapter ports in order starting at A (2 cams → ports A+B, 3 cams →
+# A+B+C).  Default is 4; override from the command line, e.g.:
+#   sudo python3 wigglegram.py 3
 NUM_CAMERAS = 4
+if len(sys.argv) > 1:
+    try:
+        NUM_CAMERAS = int(sys.argv[1])
+    except ValueError:
+        sys.exit(f"Usage: {sys.argv[0]} [number_of_cameras 2-4]")
+    if not 2 <= NUM_CAMERAS <= 4:
+        sys.exit("number_of_cameras must be 2, 3 or 4")
+
+# Frame order for the wigglegram bounce, derived from the camera count:
+#   4 cams → 0,1,2,3,2,1   3 cams → 0,1,2,1   2 cams → 0,1
+# Endpoints are not repeated, so the loop point is seamless.
+GIF_FRAME_ORDER = list(range(NUM_CAMERAS)) + list(range(NUM_CAMERAS - 2, 0, -1))
 
 # I2C --------------------------------------------------------
 I2C_BUS = 1                 # standard RPi I2C bus (GPIO 2/3)
@@ -498,10 +516,10 @@ def create_wigglegram_gif(
     frame_ms: int = GIF_SPEED_MS,
 ) -> str:
     """
-    Build a wigglegram GIF from four PIL images.
+    Build a wigglegram GIF from one PIL image per camera.
 
-    Frame order follows GIF_FRAME_ORDER so the animation bounces:
-      cam1 → cam2 → cam3 → cam4 → cam3 → cam2 → cam1
+    Frame order follows GIF_FRAME_ORDER so the animation bounces,
+    e.g. with 4 cameras: cam1 → cam2 → cam3 → cam4 → cam3 → cam2
 
     Saves to `path` and returns it.
     """
@@ -798,7 +816,7 @@ class DisplayManager:
             surfs = list(self._preview_surfs)
 
         for i, (x, y) in enumerate(self.QUAD_POSITIONS):
-            if surfs[i]:
+            if i < len(surfs) and surfs[i]:
                 self.screen.blit(surfs[i], (x, y))
             else:
                 rect = pygame.Rect(
@@ -807,7 +825,10 @@ class DisplayManager:
                     self.QUAD_SIZE[1] - 4,
                 )
                 pygame.draw.rect(self.screen, (30, 30, 30), rect)
-                lbl = self._font_sm.render(f"CAM {i + 1}", True, (120, 120, 120))
+                if i < len(surfs):
+                    lbl = self._font_sm.render(f"CAM {i + 1}", True, (120, 120, 120))
+                else:
+                    lbl = self._font_sm.render("not in use", True, (70, 70, 70))
                 self.screen.blit(lbl, (x + 8, y + 8))
 
         # Dividing grid lines
