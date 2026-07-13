@@ -26,7 +26,9 @@ Controls:
 import os
 import sys
 import time
+import shutil
 import socket
+import subprocess
 import threading
 import logging
 from datetime import datetime
@@ -107,6 +109,71 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("wigglegram")
+
+
+# ============================================================
+#  I2C bus recovery
+# ============================================================
+
+_LAST_UNSTICK = 0.0
+
+def _try_unstick_i2c_bus() -> bool:
+    """
+    Best-effort recovery of a stuck I2C bus.
+
+    Errno 110 on every transaction means a slave chip is holding SDA
+    low mid-transfer (typically after a brown-out or interrupted
+    transaction) — normally only a full power cycle clears it.  The
+    standard bus-clear procedure works in software: pulse SCL ~10
+    times so the stuck slave finishes shifting out its byte, then
+    issue a STOP condition.
+
+    RPi.GPIO can drive the pins but cannot restore their ALT0 (I2C
+    peripheral) function afterwards, so raspi-gpio is used for that.
+    Rate-limited to once per 10 s.  Returns True if it ran.
+    """
+    global _LAST_UNSTICK
+    if time.time() - _LAST_UNSTICK < 10:
+        return False
+    _LAST_UNSTICK = time.time()
+
+    if shutil.which("raspi-gpio") is None:
+        log.warning("raspi-gpio not found — cannot attempt I2C bus recovery")
+        return False
+
+    SDA, SCL = 2, 3   # BCM numbering, I2C bus 1
+    log.warning("I2C bus appears stuck — attempting bus-clear (SCL pulses + STOP)")
+    try:
+        GPIO.setup(SCL, GPIO.OUT, initial=GPIO.HIGH)
+        for _ in range(10):
+            GPIO.output(SCL, GPIO.LOW)
+            time.sleep(0.0005)
+            GPIO.output(SCL, GPIO.HIGH)
+            time.sleep(0.0005)
+        # STOP condition: SDA rises while SCL is high
+        GPIO.setup(SDA, GPIO.OUT, initial=GPIO.LOW)
+        time.sleep(0.0005)
+        GPIO.output(SCL, GPIO.HIGH)
+        time.sleep(0.0005)
+        GPIO.output(SDA, GPIO.HIGH)
+        time.sleep(0.0005)
+    except Exception as exc:
+        log.error("I2C bus-clear GPIO toggling failed: %s", exc)
+    finally:
+        # Hand SDA/SCL back to the hardware I2C peripheral (ALT0)
+        for pin in (SDA, SCL):
+            try:
+                subprocess.run(
+                    ["raspi-gpio", "set", str(pin), "a0", "pu"],
+                    check=False, timeout=5,
+                )
+            except Exception as exc:
+                log.error("raspi-gpio restore failed for GPIO %d: %s", pin, exc)
+                return False
+
+    time.sleep(0.1)
+    log.info("I2C bus-clear done — retrying")
+    return True
 
 
 # ============================================================
@@ -208,6 +275,10 @@ class ArducamAdapter:
                 last_exc = exc
                 log.warning("Arducam I2C write attempt %d/%d failed: %s",
                             attempt + 1, retries, exc)
+                # errno 110 = the bus itself is wedged (a slave holding
+                # SDA low) — retries are pointless until it's cleared
+                if getattr(exc, "errno", None) == 110:
+                    _try_unstick_i2c_bus()
                 time.sleep(0.3)
 
         log.error("Arducam I2C write failed after %d retries", retries)
