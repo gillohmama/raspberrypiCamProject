@@ -26,12 +26,12 @@ sudo apt-get install -y \
     rpicam-apps
 
 echo "=== Installing Python packages ==="
-pip3 install --break-system-packages \
-    smbus2 \
-    Pillow \
-    numpy \
-    pygame \
-    picamera2
+# Only smbus2 comes from pip — numpy, Pillow, pygame and picamera2 are
+# already installed by apt above.  Installing them via pip as well can
+# pull in incompatible versions (e.g. numpy 2.x, or a picamera2 that
+# mismatches the apt python3-libcamera bindings) and break the camera
+# stack.
+pip3 install --break-system-packages smbus2
 
 echo ""
 echo "=== /boot/firmware/config.txt changes needed ==="
@@ -66,8 +66,8 @@ echo "  0x57 = PiSugar 3 Plus"
 echo "  0x70 = Arducam Multi Camera Adapter"
 echo ""
 echo "=== Select camera and verify camera is detected ==="
-echo "Run these after reboot:"
-echo "  sudo i2cset -y 1 0x70 0x01"
+echo "Run these after reboot (selects camera A: register 0x00, value 0x04):"
+echo "  sudo i2cset -y 1 0x70 0x00 0x04"
 echo "  sudo modprobe -r imx219"
 echo "  sudo modprobe imx219"
 echo "  rpicam-still --list-cameras"

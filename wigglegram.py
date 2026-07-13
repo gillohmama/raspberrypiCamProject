@@ -109,7 +109,7 @@ class ArducamAdapter:
     GPIO pin mapping (BCM numbering, from AdapterTestDemo.py):
       GPIO 4  (board pin  7) = select bit A
       GPIO 17 (board pin 11) = select bit B
-      GPIO 27 (board pin 12) = output enable (OE)
+      GPIO 18 (board pin 12) = output enable (OE)
 
     Camera → (A, B, OE):
       0 → LOW,  LOW,  HIGH
@@ -164,6 +164,11 @@ class ArducamAdapter:
             return
         if not 0 <= cam < NUM_CAMERAS:
             raise ValueError(f"Camera index must be 0-{NUM_CAMERAS - 1}")
+
+        # Mark state unknown until BOTH switches succeed — if the I2C
+        # write below fails, the GPIO mux has already moved and a later
+        # select() for the old camera must not early-return.
+        self._current = -1
 
         # 1. GPIO — switch the CSI data lane mux
         a, b, oe = self._GPIO_CAM[cam]
@@ -229,6 +234,9 @@ class CameraManager:
         self._cam: Optional[Picamera2] = None
         self._current_cam = -1
         self._fail_count: dict = {}    # cam → consecutive failure count
+        # Serialises all camera access — the preview thread and the
+        # capture thread must never configure/start/stop concurrently.
+        self._lock = threading.Lock()
         self._init_camera()
 
     # ------------------------------------------------------------------
@@ -286,12 +294,20 @@ class CameraManager:
         except Exception:
             self._cam = None
 
-        # Switch mux to camera 0 BEFORE creating new Picamera2
-        self._adapter.select(0)
-        time.sleep(0.5)
-        self._cam = Picamera2()
-        self._current_cam = 0
-        log.info("Camera recovered successfully")
+        # Switch mux to camera 0 BEFORE creating new Picamera2.
+        # Recovery must never raise: it runs inside except-handlers on
+        # the preview/capture threads, and an exception here would kill
+        # the preview thread and freeze the viewfinder.
+        try:
+            self._adapter.select(0)
+            time.sleep(0.5)
+            self._cam = Picamera2()
+            self._current_cam = 0
+            log.info("Camera recovered successfully")
+        except Exception as exc:
+            log.error("Camera recovery failed (%s) — will retry on next capture", exc)
+            self._cam = None
+            self._current_cam = -1
 
     # ------------------------------------------------------------------
     def _capture_with_timeout(self, timeout: float = 2.0) -> Optional[np.ndarray]:
@@ -331,91 +347,100 @@ class CameraManager:
         """
         blank = np.zeros((PREVIEW_HEIGHT, PREVIEW_WIDTH, 3), dtype=np.uint8)
 
-        # Skip cameras that have failed recently — retry every 30th pass
-        # (about every 30 seconds) so they can recover if reconnected.
+        # Skip cameras that have failed recently, retrying every 30th
+        # pass so they can recover if reconnected.  The counter must
+        # keep advancing on skipped passes too — if it only counted
+        # failures it would freeze at 2 and the camera would never be
+        # retried again.
         fail_n = self._fail_count.get(cam, 0)
-        if fail_n >= 2 and fail_n % 30 != 0:
-            return blank
+        if fail_n >= 2:
+            self._fail_count[cam] = fail_n + 1
+            if fail_n % 30 != 0:
+                return blank
 
-        try:
-            if self._cam is None:
-                self._init_camera()
+        with self._lock:
+            try:
+                if self._cam is None:
+                    self._init_camera()
 
-            self._safe_stop()
+                self._safe_stop()
 
-            # Switch the hardware mux if camera changed
-            if cam != self._current_cam:
-                self._adapter.select(cam)
-                time.sleep(self.MUX_SETTLE)
-                self._current_cam = cam
+                # Switch the hardware mux if camera changed
+                if cam != self._current_cam:
+                    self._adapter.select(cam)
+                    time.sleep(self.MUX_SETTLE)
+                    self._current_cam = cam
 
-            # Full configure → start → capture → stop (safest approach)
-            cfg = self._cam.create_video_configuration(
-                main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
-                      "format": "RGB888"},
-            )
-            self._cam.configure(cfg)
-            self._cam.start()
-            time.sleep(self.AEC_SETTLE)
-            frame = self._capture_with_timeout(self.CAPTURE_TIMEOUT)
-            self._cam.stop()
+                # Full configure → start → capture → stop (safest approach)
+                cfg = self._cam.create_video_configuration(
+                    main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                          "format": "RGB888"},
+                )
+                self._cam.configure(cfg)
+                self._cam.start()
+                time.sleep(self.AEC_SETTLE)
+                frame = self._capture_with_timeout(self.CAPTURE_TIMEOUT)
+                self._cam.stop()
 
-            if frame is None:
-                raise RuntimeError("capture timed out")
+                if frame is None:
+                    raise RuntimeError("capture timed out")
 
-            # Success — reset failure counter
-            self._fail_count[cam] = 0
-            return frame
+                # Success — reset failure counter
+                self._fail_count[cam] = 0
+                return frame
 
-        except Exception as exc:
-            log.warning("Preview cam %d failed: %s", cam, exc)
-            self._fail_count[cam] = self._fail_count.get(cam, 0) + 1
-            # V4L2 errors corrupt driver state — full recovery needed
-            self._recover_camera()
-            return blank
+            except Exception as exc:
+                log.warning("Preview cam %d failed: %s", cam, exc)
+                self._fail_count[cam] = self._fail_count.get(cam, 0) + 1
+                # V4L2 errors corrupt driver state — full recovery needed
+                self._recover_camera()
+                return blank
 
     def stop_preview_stream(self) -> None:
         """Ensure the camera is stopped (called before capture_photo)."""
-        self._safe_stop()
+        with self._lock:
+            self._safe_stop()
 
     def capture_photo(self, cam: int) -> Optional[Image.Image]:
         """
         Capture a full-resolution still from camera *cam*.
         Returns a PIL Image, or None on failure.
         """
-        try:
-            if self._cam is None:
-                self._init_camera()
+        with self._lock:
+            try:
+                if self._cam is None:
+                    self._init_camera()
 
-            self._safe_stop()
+                self._safe_stop()
 
-            if cam != self._current_cam:
-                self._adapter.select(cam)
-                time.sleep(0.5)
-                self._current_cam = cam
+                if cam != self._current_cam:
+                    self._adapter.select(cam)
+                    time.sleep(0.5)
+                    self._current_cam = cam
 
-            cfg = self._cam.create_still_configuration(
-                main={"size": (PHOTO_WIDTH, PHOTO_HEIGHT), "format": "RGB888"},
-                raw=None,               # skip raw buffer — RGB only
-            )
-            self._cam.configure(cfg)
-            self._cam.start()
-            time.sleep(0.5)             # let AEC/AWB settle fully
-            frame = self._capture_with_timeout(5.0)
-            self._cam.stop()
+                cfg = self._cam.create_still_configuration(
+                    main={"size": (PHOTO_WIDTH, PHOTO_HEIGHT), "format": "RGB888"},
+                    raw=None,               # skip raw buffer — RGB only
+                )
+                self._cam.configure(cfg)
+                self._cam.start()
+                time.sleep(0.5)             # let AEC/AWB settle fully
+                frame = self._capture_with_timeout(5.0)
+                self._cam.stop()
 
-            if frame is None:
-                raise RuntimeError("capture timed out")
+                if frame is None:
+                    raise RuntimeError("capture timed out")
 
-            return Image.fromarray(frame)
+                return Image.fromarray(frame)
 
-        except Exception as exc:
-            log.error("Photo cam %d failed: %s", cam, exc)
-            self._recover_camera()
-            return None
+            except Exception as exc:
+                log.error("Photo cam %d failed: %s", cam, exc)
+                self._recover_camera()
+                return None
 
     def close(self) -> None:
-        self._close_camera()
+        with self._lock:
+            self._close_camera()
 
 
 # ============================================================
@@ -502,6 +527,12 @@ class PiSugarButton:
 
     # --- socket method ------------------------------------------------
     def _socket_loop(self) -> None:
+        """
+        pisugar-server pushes tap events ("single" / "double" / "long")
+        to every connected client on its own — there is no poll command
+        for taps.  So we simply hold the connection open and react to
+        whatever arrives.
+        """
         while self._running:
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -511,23 +542,23 @@ class PiSugarButton:
 
                     while self._running:
                         try:
-                            sock.sendall(b"get button_tab\n")
-                            raw = sock.recv(256).decode(errors="replace").strip()
+                            raw = sock.recv(256)
                         except socket.timeout:
                             continue
 
-                        if "double" in raw:
+                        if not raw:   # server closed the connection
+                            raise ConnectionResetError("pisugar-server closed socket")
+
+                        text = raw.decode(errors="replace")
+
+                        if "double" in text:
                             log.info("PiSugar: double-click")
-                            sock.sendall(b"set_button_tab clear\n")
                             if self.on_double_click:
                                 self.on_double_click()
-                        elif "single" in raw:
+                        elif "single" in text:
                             log.info("PiSugar: single-click")
-                            sock.sendall(b"set_button_tab clear\n")
                             if self.on_single_click:
                                 self.on_single_click()
-
-                        time.sleep(0.08)
 
             except (ConnectionRefusedError, FileNotFoundError):
                 log.warning("PiSugar socket unavailable, switching to I2C polling")
@@ -726,11 +757,15 @@ class DisplayManager:
 
     def _draw_gif(self) -> None:
         now = time.time()
-        if self._gif_surfs:
+        # Local reference: show_gif() runs on another thread and may swap
+        # _gif_surfs for a shorter list mid-draw; the modulo keeps the
+        # stale index in range instead of raising IndexError.
+        surfs = self._gif_surfs
+        if surfs:
             if (now - self._gif_t) * 1000 >= self.gif_speed:
-                self._gif_idx = (self._gif_idx + 1) % len(self._gif_surfs)
+                self._gif_idx = (self._gif_idx + 1) % len(surfs)
                 self._gif_t   = now
-            self.screen.blit(self._gif_surfs[self._gif_idx], (0, 0))
+            self.screen.blit(surfs[self._gif_idx % len(surfs)], (0, 0))
 
         speed_txt = self._font_sm.render(
             f"{self.gif_speed} ms/frame  [tap L=slower  R=faster]",
@@ -806,6 +841,10 @@ class WigglegramApp:
             self._display.show_preview()
             return
         if not self._capturing:
+            # Set the flag here, not inside the thread — otherwise a
+            # rapid second click could spawn two capture threads before
+            # the first one gets scheduled.
+            self._capturing = True
             threading.Thread(
                 target=self._capture_sequence,
                 daemon=True,
@@ -868,26 +907,36 @@ class WigglegramApp:
 
     def _preview_loop(self) -> None:
         """
-        Continuously cycles cameras, capturing multiple preview frames per
-        camera before switching to the next.  This drastically reduces
-        overhead because the expensive stop/reconfigure/start cycle only
-        happens on camera *switches*, not on every single frame.
-
-        Each quadrant's cached Surface is always visible, so even while
-        we're streaming from camera 2, cameras 0/1/3 still show their
-        most recent frame (slightly stale but never blank).
+        Continuously cycles through the four cameras, grabbing one
+        preview frame from each in turn.  Each quadrant keeps showing
+        its most recent frame while the other cameras are being read.
 
         Pauses while a full still capture or GIF view is active.
         """
         cam = 0
+        paused = False
         while self._running:
             if self._capturing or self._display.mode == "gif":
-                self._cameras.stop_preview_stream()
+                # Stop the stream ONCE when entering the paused state —
+                # and never while a still capture is running: the capture
+                # thread owns the camera then, and stopping it from here
+                # mid-exposure aborts the still and corrupts V4L2 state.
+                if not paused:
+                    paused = True
+                    if not self._capturing:
+                        self._cameras.stop_preview_stream()
                 time.sleep(0.1)
                 continue
+            paused = False
 
-            frame = self._cameras.capture_preview(cam)
-            self._display.update_preview(cam, frame)
+            try:
+                frame = self._cameras.capture_preview(cam)
+                self._display.update_preview(cam, frame)
+            except Exception:
+                # A dying preview thread would freeze the viewfinder
+                # forever — log and keep cycling instead.
+                log.exception("Preview loop error — continuing")
+                time.sleep(0.5)
 
             # Advance to next camera
             cam = (cam + 1) % NUM_CAMERAS
