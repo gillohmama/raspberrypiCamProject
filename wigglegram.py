@@ -763,7 +763,10 @@ class PiSugarButton:
                     while self._running and time.time() < deadline:
                         time.sleep(0.2)
 
-            time.sleep(0.05)   # ~20 Hz polling
+            # 2 Hz is plenty: tap flags are latched in the register
+            # until cleared, and hammering the PiSugar's MCU at 20 Hz
+            # is suspected of glitching it into wedging the I2C bus.
+            time.sleep(0.5)
 
         bus.close()
 
