@@ -326,7 +326,18 @@ class CameraManager:
         # Serialises all camera access — the preview thread and the
         # capture thread must never configure/start/stop concurrently.
         self._lock = threading.Lock()
+        # Consecutive failed recoveries.  Once an abandoned zombie
+        # instance keeps libcamera's Camera in "Running" state, no
+        # reopen in this process can ever succeed — the app watches
+        # this via `unrecoverable` and restarts itself.
+        self._recovery_failures = 0
         self._init_camera()
+
+    @property
+    def unrecoverable(self) -> bool:
+        """True when repeated recoveries failed and only a process
+        restart can bring the camera stack back."""
+        return self._recovery_failures >= 3
 
     # ------------------------------------------------------------------
     def _init_camera(self) -> None:
@@ -412,6 +423,7 @@ class CameraManager:
             # new Picamera2 now would fail or hang too.  Leave _cam as
             # None; the next capture attempt re-initialises once the
             # driver frees up.
+            self._recovery_failures += 1
             return
 
         # Switch mux to camera 0 BEFORE creating new Picamera2
@@ -420,11 +432,13 @@ class CameraManager:
             time.sleep(0.5)
             self._cam = Picamera2()
             self._current_cam = 0
+            self._recovery_failures = 0
             log.info("Camera recovered successfully")
         except Exception as exc:
             log.error("Camera recovery failed (%s) — will retry on next capture", exc)
             self._cam = None
             self._current_cam = -1
+            self._recovery_failures += 1
 
     # ------------------------------------------------------------------
     def _capture_with_timeout(self, timeout: float = 2.0) -> Optional[np.ndarray]:
@@ -507,8 +521,9 @@ class CameraManager:
 
                 self._cam.stop()
 
-                # Success — reset failure counter
+                # Success — reset failure counters
                 self._fail_count[cam] = 0
+                self._recovery_failures = 0
                 return frame
 
             except Exception as exc:
@@ -1100,8 +1115,28 @@ class WigglegramApp:
                 log.exception("Preview loop error — continuing")
                 time.sleep(0.5)
 
+            if self._cameras.unrecoverable:
+                self._restart_app()
+
             # Advance to next camera
             cam = (cam + 1) % NUM_CAMERAS
+
+    def _restart_app(self) -> None:
+        """
+        Last-resort recovery: replace this process with a fresh one.
+
+        When a wedged Picamera2 teardown had to be abandoned, the
+        zombie thread keeps libcamera's Camera in "Running" state and
+        every reopen in this process fails with "Camera in Running
+        state trying acquire()".  Only a fresh process clears that
+        state.  os.execv() restarts in place — same terminal, same
+        arguments, ~3 seconds of downtime.
+        """
+        log.error("Camera stack unrecoverable in this process — restarting the app")
+        self._display.set_status("Camera error — restarting…", 3.0)
+        time.sleep(2.0)     # let the main loop draw the message
+        os.execv(sys.executable,
+                 [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:])
 
     # ------------------------------------------------------------------
     #  Helpers
