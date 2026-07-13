@@ -273,31 +273,59 @@ class CameraManager:
                 pass
             self._cam = None
 
+    def _dispose_camera_async(self, cam_obj, join_timeout: float = 3.0) -> bool:
+        """
+        Stop and close a Picamera2 instance on a background thread with
+        a bounded wait.
+
+        After a capture_array() timeout, the zombie capture thread may
+        still hold Picamera2's internal locks — calling stop()/close()
+        directly then deadlocks the calling thread forever (observed as
+        the whole viewfinder freezing).  Returns True if the teardown
+        finished within join_timeout.
+        """
+        def _dispose():
+            try:
+                cam_obj.stop()
+            except Exception:
+                pass
+            try:
+                cam_obj.close()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_dispose, daemon=True, name="cam-dispose")
+        t.start()
+        t.join(join_timeout)
+        if t.is_alive():
+            log.error("Picamera2 teardown is stuck — abandoning the instance")
+            return False
+        return True
+
     def _recover_camera(self) -> None:
         """
         Nuclear recovery: close Picamera2 completely and reopen it on
         camera 0 (known-good).  This resets the V4L2 driver state after
         a bad camera port corrupts the buffer queues.
+
+        Must never raise OR block indefinitely: it runs inside
+        except-handlers on the preview/capture threads while holding
+        the camera lock — a hang here freezes the viewfinder and even
+        blocks shutdown.
         """
         log.warning("Recovering camera — full close/reopen on cam 0")
-        try:
-            if self._cam is not None:
-                try:
-                    self._cam.stop()
-                except Exception:
-                    pass
-                try:
-                    self._cam.close()
-                except Exception:
-                    pass
-                self._cam = None
-        except Exception:
-            self._cam = None
+        old = self._cam
+        self._cam = None
+        self._current_cam = -1
 
-        # Switch mux to camera 0 BEFORE creating new Picamera2.
-        # Recovery must never raise: it runs inside except-handlers on
-        # the preview/capture threads, and an exception here would kill
-        # the preview thread and freeze the viewfinder.
+        if old is not None and not self._dispose_camera_async(old):
+            # The wedged instance still holds /dev/video0 — opening a
+            # new Picamera2 now would fail or hang too.  Leave _cam as
+            # None; the next capture attempt re-initialises once the
+            # driver frees up.
+            return
+
+        # Switch mux to camera 0 BEFORE creating new Picamera2
         try:
             self._adapter.select(0)
             time.sleep(0.5)
@@ -380,10 +408,15 @@ class CameraManager:
                 self._cam.start()
                 time.sleep(self.AEC_SETTLE)
                 frame = self._capture_with_timeout(self.CAPTURE_TIMEOUT)
-                self._cam.stop()
 
                 if frame is None:
+                    # Do NOT call stop() here — the zombie capture
+                    # thread may hold Picamera2's internal locks and
+                    # stop() deadlocks.  _recover_camera tears the
+                    # instance down on a disposable thread instead.
                     raise RuntimeError("capture timed out")
+
+                self._cam.stop()
 
                 # Success — reset failure counter
                 self._fail_count[cam] = 0
@@ -426,10 +459,13 @@ class CameraManager:
                 self._cam.start()
                 time.sleep(0.5)             # let AEC/AWB settle fully
                 frame = self._capture_with_timeout(5.0)
-                self._cam.stop()
 
                 if frame is None:
+                    # Same as preview: stop() can deadlock after a
+                    # timeout; leave teardown to _recover_camera.
                     raise RuntimeError("capture timed out")
+
+                self._cam.stop()
 
                 return Image.fromarray(frame)
 
@@ -439,8 +475,18 @@ class CameraManager:
                 return None
 
     def close(self) -> None:
-        with self._lock:
-            self._close_camera()
+        # Bounded acquire: if a stuck recovery holds the lock, don't
+        # hang shutdown — the process is exiting anyway.
+        if self._lock.acquire(timeout=5):
+            try:
+                old = self._cam
+                self._cam = None
+                if old is not None:
+                    self._dispose_camera_async(old)
+            finally:
+                self._lock.release()
+        else:
+            log.warning("Camera lock busy at shutdown — skipping camera close")
 
 
 # ============================================================
@@ -581,9 +627,15 @@ class PiSugarButton:
             PISUGAR_I2C_ADDR, PISUGAR_BTN_REG,
         )
 
+        consec_fail = 0
+
         while self._running:
             try:
                 val = bus.read_byte_data(PISUGAR_I2C_ADDR, PISUGAR_BTN_REG)
+
+                if consec_fail >= 20:
+                    log.info("PiSugar: I2C responding again")
+                consec_fail = 0
 
                 if val & PISUGAR_DOUBLE_BIT:
                     log.info("PiSugar: double-click (I2C raw=0x%02X)", val)
@@ -604,8 +656,23 @@ class PiSugarButton:
                         self.on_single_click()
 
             except OSError as exc:
-                log.warning("PiSugar I2C read error: %s", exc)
-                time.sleep(0.5)
+                consec_fail += 1
+                if consec_fail < 20:
+                    log.warning("PiSugar I2C read error: %s", exc)
+                    time.sleep(0.5)
+                else:
+                    # Device is not answering at all (absent, off, or a
+                    # different PiSugar model/address) — stop spamming
+                    # the log and the I2C bus; retry every 10 s.
+                    if consec_fail == 20:
+                        log.warning(
+                            "PiSugar not responding at 0x%02X — "
+                            "check i2cdetect -y 1.  Slowing polling to 10 s",
+                            PISUGAR_I2C_ADDR,
+                        )
+                    deadline = time.time() + 10
+                    while self._running and time.time() < deadline:
+                        time.sleep(0.2)
 
             time.sleep(0.05)   # ~20 Hz polling
 
