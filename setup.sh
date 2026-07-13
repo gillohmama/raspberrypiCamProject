@@ -22,8 +22,12 @@ sudo apt-get install -y \
     python3-picamera2 \
     i2c-tools \
     libopenblas-dev \
-    libopenjp2-7 \
-    rpicam-apps
+    libopenjp2-7
+
+# Camera CLI tools were renamed between OS releases — one unknown
+# package name aborts the whole apt-get line, so install separately:
+#   Bookworm and newer: rpicam-apps      Bullseye: libcamera-apps
+sudo apt-get install -y rpicam-apps || sudo apt-get install -y libcamera-apps
 
 echo "=== Installing Python packages ==="
 # Only smbus2 comes from pip — numpy, Pillow, pygame and picamera2 are
@@ -31,7 +35,10 @@ echo "=== Installing Python packages ==="
 # pull in incompatible versions (e.g. numpy 2.x, or a picamera2 that
 # mismatches the apt python3-libcamera bindings) and break the camera
 # stack.
-pip3 install --break-system-packages smbus2
+# --break-system-packages only exists on Bookworm's pip; fall back to a
+# plain install on Bullseye and older.  sudo so the module is visible
+# when the app is run with "sudo python3".
+sudo pip3 install --break-system-packages smbus2 || sudo pip3 install smbus2
 
 echo ""
 echo "=== /boot/firmware/config.txt changes needed ==="
@@ -70,7 +77,8 @@ echo "Run these after reboot (selects camera A: register 0x00, value 0x04):"
 echo "  sudo i2cset -y 1 0x70 0x00 0x04"
 echo "  sudo modprobe -r imx219"
 echo "  sudo modprobe imx219"
-echo "  rpicam-still --list-cameras"
+echo "  rpicam-still --list-cameras      (Bookworm)"
+echo "  libcamera-still --list-cameras   (Bullseye)"
 echo ""
 echo "=== PiSugar 3 Plus daemon (optional but recommended) ==="
 echo "Install pisugar-server for reliable button detection:"
