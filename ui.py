@@ -62,8 +62,8 @@ class DisplayManager:
         self._gif_idx = 0
         self._gif_next_t = 0.0
         self._speed_flash_until = 0.0
-        LOG.info("display up: %dx%d %s, %d camera tiles", SCREEN_W, SCREEN_H,
-                 "windowed" if windowed else "fullscreen", num_cams)
+        LOG.debug("display up: %dx%d %s, %d camera tiles", SCREEN_W, SCREEN_H,
+                  "windowed" if windowed else "fullscreen", num_cams)
 
     @staticmethod
     def _layout(n):
@@ -262,7 +262,7 @@ class DisplayManager:
         self.gif_frames = frames
         self._gif_idx = 0
         self._gif_next_t = 0.0
-        LOG.info("loaded %s (%d frames)", path, len(frames))
+        LOG.debug("loaded %s (%d frames)", path, len(frames))
 
     def draw_playback(self):
         now = time.time()
@@ -285,7 +285,7 @@ class DisplayManager:
         ms = self.frame_ms / SPEED_STEP if faster else self.frame_ms * SPEED_STEP
         self.frame_ms = int(min(MAX_FRAME_MS, max(MIN_FRAME_MS, round(ms))))
         self._speed_flash_until = time.time() + 1.5
-        LOG.info("playback speed: %d ms/frame", self.frame_ms)
+        LOG.debug("playback speed: %d ms/frame", self.frame_ms)
 
     # -------------------------------------------------------------- fatal
 

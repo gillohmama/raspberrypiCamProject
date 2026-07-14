@@ -57,24 +57,38 @@ def resolve_pics_dir():
     return pics
 
 
-def setup_logging():
+class _ConsoleFormatter(logging.Formatter):
+    """Terse human-readable console lines: time + message, level name only
+    when something is actually wrong."""
+
+    def format(self, record):
+        stamp = time.strftime("%H:%M:%S", time.localtime(record.created))
+        level = ("" if record.levelno < logging.WARNING
+                 else record.levelname + ": ")
+        return "%s  %s%s" % (stamp, level, record.getMessage())
+
+
+def setup_logging(verbose):
+    """Console gets the short story; wigglecam.log gets everything."""
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    fmt = logging.Formatter(
-        "%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s",
-        "%Y-%m-%d %H:%M:%S")
+    root.setLevel(logging.DEBUG)
     console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(_ConsoleFormatter())
     root.addHandler(console)
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "wigglecam.log")
     try:
         rotating = logging.handlers.RotatingFileHandler(
             log_path, maxBytes=1_000_000, backupCount=3)
-        rotating.setFormatter(fmt)
+        rotating.setLevel(logging.DEBUG)
+        rotating.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s",
+            "%Y-%m-%d %H:%M:%S"))
         root.addHandler(rotating)
     except OSError as exc:
         root.warning("cannot open %s (%s) — console logging only", log_path, exc)
+    logging.getLogger("PIL").setLevel(logging.INFO)
 
 
 def self_restart(reason):
@@ -134,8 +148,8 @@ class App:
     def run(self):
         self.service.start()
         self.buttons.start()
-        LOG.info("app running (pics=%s, latest_gif=%s)",
-                 self.pics_dir, self.latest_gif)
+        LOG.info("ready — photos will be saved to %s", self.pics_dir)
+        LOG.debug("latest gif: %s", self.latest_gif)
         self.display.set_status("Ready — tap the button or SPACE to shoot", 5)
         clock = pygame.time.Clock()
         while self.running:
@@ -252,15 +266,15 @@ class App:
     # ------------------------------------------------------------- cleanup
 
     def shutdown(self):
-        LOG.info("shutting down")
+        LOG.info("stopping…")
         self.buttons.stop()
         self.service.stop()
         self.service.join(timeout=5)
         if self.service.is_alive():
-            LOG.warning("camera service still busy — killing worker directly")
+            LOG.debug("camera service still busy — killing worker directly")
             self.service.link.kill()
         self.display.close()
-        LOG.info("bye")
+        LOG.info("stopped cleanly")
 
 
 def main():
@@ -277,11 +291,15 @@ def main():
                              "thumbnails; grid round-robins all cameras")
     parser.add_argument("--windowed", action="store_true",
                         help="don't go fullscreen (development)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="show full detail on the console too "
+                             "(wigglecam.log always has it)")
     args = parser.parse_args()
 
-    setup_logging()
-    LOG.info("wigglecam starting: cams=%d preview=%s argv=%s",
-             args.num_cams, args.preview_mode, sys.argv)
+    setup_logging(args.verbose)
+    LOG.info("starting — %d cameras, %s preview, %s view",
+             args.num_cams, args.preview_mode, args.view)
+    LOG.debug("argv=%s", sys.argv)
 
     app = None
     fatal = None

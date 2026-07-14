@@ -126,15 +126,29 @@ Three worker deaths while in fast mode auto-demote the session to safe.
 
 ## Logs
 
-Everything goes to stdout and `wigglecam.log` (rotating, 1 MB × 3) with
-timestamps and a logger name per subsystem: `main`, `ui`, `camsvc`, `camlink`,
-`worker`, `pisugar`, `gif`. Useful greps:
+The console shows the short story in plain English — startup, captures,
+camera health changes, warnings. A healthy session looks like:
+
+```
+14:02:11  starting — 3 cameras, fast preview, live view
+14:02:13  camera engine running (pid 1234, fast preview)
+14:02:13  ready — photos will be saved to /home/nsgill/piCameraPics
+14:02:16  no PiSugar detected — SPACE key is the shutter
+14:03:02  capture started (cameras 1, 2, 3)
+14:03:08  wigglegram saved: 20260714-140302_wigglegram.gif (3 photos)
+```
+
+The full detail (every worker line, libcamera output, retries, timings)
+goes to `wigglecam.log` (rotating, 1 MB × 3) with a logger name per
+subsystem — **paste that file when reporting problems**, not the console.
+`--verbose` mirrors the full detail to the console. Useful greps:
 
 ```
 grep -E "WARN|ERROR" wigglecam.log        # anything unhappy
 grep camlink wigglecam.log                # worker kills / respawns / timeouts
 grep "worker]" wigglecam.log              # inside the camera process (mux, libcamera)
-grep pisugar wigglecam.log                # button + battery I2C behaviour
+grep pisugar wigglecam.log                # button I2C behaviour
+grep -i capture wigglecam.log             # shots and their outcomes
 grep RESTART wigglecam.log                # self-restarts
 ```
 

@@ -77,7 +77,7 @@ class WorkerLink:
     def start(self):
         worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "camera_worker.py")
-        LOG_LINK.info("spawning camera worker (preview_mode=%s)", self.preview_mode)
+        LOG_LINK.debug("spawning camera worker (preview_mode=%s)", self.preview_mode)
         self._buf = bytearray()
         self._proc = subprocess.Popen(
             [sys.executable, "-u", worker, "--preview-mode", self.preview_mode],
@@ -89,16 +89,23 @@ class WorkerLink:
         if header.get("event") != "ready":
             raise WorkerDied("worker startup failed: %s"
                              % header.get("error", header))
-        LOG_LINK.info("worker ready (pid=%d)", self._proc.pid)
+        LOG_LINK.info("camera engine running (pid %d, %s preview)",
+                      self._proc.pid, self.preview_mode)
 
     @staticmethod
     def _pump_stderr(proc):
+        # Worker/libcamera chatter goes to the log file only; anything that
+        # looks like trouble surfaces on the console too.
         wlog = logging.getLogger("worker")
         try:
             for raw in proc.stderr:
                 line = raw.decode("utf-8", "replace").rstrip()
-                if line:
-                    wlog.info("%s", line)
+                if not line:
+                    continue
+                if "ERROR" in line or "WARN" in line or "FATAL" in line:
+                    wlog.warning("%s", line)
+                else:
+                    wlog.debug("%s", line)
         except Exception:
             pass
 
@@ -163,7 +170,7 @@ class WorkerLink:
         if proc is None:
             return
         if proc.poll() is None:
-            LOG_LINK.warning("killing camera worker pid=%d", proc.pid)
+            LOG_LINK.debug("killing camera worker pid=%d", proc.pid)
             try:
                 proc.kill()
             except Exception:
@@ -253,7 +260,7 @@ class CameraService(threading.Thread):
 
     def set_view(self, view):
         self.view = view
-        LOG_SVC.info("view -> %s", view)
+        LOG_SVC.debug("view -> %s", view)
 
     def set_live_cam(self, cam):
         if not 0 <= cam < self.num_cams or cam == self.live_cam:
@@ -262,7 +269,7 @@ class CameraService(threading.Thread):
             self.events.put(("status", "Camera %d is offline" % (cam + 1)))
             return
         self.live_cam = cam
-        LOG_SVC.info("live camera -> %d", cam + 1)
+        LOG_SVC.debug("live camera -> %d", cam + 1)
         self.events.put(("status", "Live view: camera %d" % (cam + 1)))
 
     def stop(self):
@@ -300,7 +307,7 @@ class CameraService(threading.Thread):
                     break
                 time.sleep(1.0)
         self.link.shutdown()
-        LOG_SVC.info("camera service stopped")
+        LOG_SVC.debug("camera service stopped")
 
     # ------------------------------------------------------------ previews
 
@@ -310,7 +317,7 @@ class CameraService(threading.Thread):
             h = self.health[c]
             if h["state"] == "dead" and now - h["last_retry"] >= DEAD_RETRY_INTERVAL_S:
                 h["last_retry"] = now
-                LOG_SVC.info("retrying dead cam %d", c + 1)
+                LOG_SVC.debug("retrying offline camera %d", c + 1)
                 return c
         alive = [c for c in range(self.num_cams)
                  if self.health[c]["state"] == "alive"]
@@ -327,7 +334,7 @@ class CameraService(threading.Thread):
         # the deliberately long cadence).
         if self.live_cam not in alive:
             self.live_cam = alive[0]
-            LOG_SVC.info("live camera died — switching to cam %d",
+            LOG_SVC.info("live view switched to camera %d (previous one went offline)",
                          self.live_cam + 1)
             self.events.put(("status",
                              "Live view: camera %d" % (self.live_cam + 1)))
@@ -365,7 +372,7 @@ class CameraService(threading.Thread):
     def _mark_alive(self, cam):
         h = self.health[cam]
         if h["state"] == "dead":
-            LOG_SVC.info("cam %d back online", cam + 1)
+            LOG_SVC.info("camera %d is back online", cam + 1)
             self.events.put(("status", "Camera %d back online" % (cam + 1)))
         h["state"] = "alive"
         h["timeouts"] = 0
@@ -374,7 +381,8 @@ class CameraService(threading.Thread):
     def _mark_dead(self, cam, reason):
         h = self.health[cam]
         if h["state"] != "dead":
-            LOG_SVC.warning("cam %d marked DEAD: %s", cam + 1, reason)
+            LOG_SVC.warning("camera %d is offline — will keep retrying "
+                            "every 30 s (%s)", cam + 1, reason)
             self.events.put(("status", "Camera %d offline" % (cam + 1)))
         h["state"] = "dead"
         h["last_retry"] = time.monotonic()
@@ -382,14 +390,15 @@ class CameraService(threading.Thread):
     def _soft_fail(self, cam, error):
         h = self.health[cam]
         h["soft"] += 1
-        LOG_SVC.warning("cam %d soft failure %d/%d: %s",
-                        cam + 1, h["soft"], SOFT_FAILS_TO_DEAD, error)
+        LOG_SVC.debug("cam %d soft failure %d/%d: %s",
+                      cam + 1, h["soft"], SOFT_FAILS_TO_DEAD, error)
         if h["soft"] >= SOFT_FAILS_TO_DEAD:
             self._mark_dead(cam, error)
 
     def _worker_incident(self, cam, exc):
         """The worker hung or died while serving `cam`: kill, blame, respawn."""
-        LOG_SVC.warning("worker incident on cam %d: %s", cam + 1, exc)
+        LOG_SVC.warning("camera %d not responding — restarting the camera "
+                        "engine (%s)", cam + 1, exc)
         self.link.kill()
 
         h = self.health[cam]
@@ -402,10 +411,8 @@ class CameraService(threading.Thread):
             self._fast_strikes = [t for t in self._fast_strikes
                                   if now - t < FAST_STRIKE_WINDOW_S] + [now]
             if len(self._fast_strikes) >= FAST_STRIKES_TO_DEMOTE:
-                LOG_SVC.warning("fast preview unstable (%d worker deaths in "
-                                "%.0f min) — demoting to safe mode",
-                                len(self._fast_strikes),
-                                FAST_STRIKE_WINDOW_S / 60)
+                LOG_SVC.warning("fast preview keeps failing — switching to "
+                                "the slower safe mode")
                 self.link.preview_mode = "safe"
                 self._fast_strikes = []
                 self.events.put(("status", "Preview demoted to SAFE mode"))
@@ -426,7 +433,7 @@ class CameraService(threading.Thread):
             except Exception as exc:
                 self.link.kill()
                 self._spawn_fails += 1
-                LOG_SVC.error("worker spawn failed (%d/%d): %s",
+                LOG_SVC.error("camera engine failed to start (attempt %d/%d): %s",
                               self._spawn_fails, SPAWN_FAILS_TO_FATAL, exc)
                 if self._spawn_fails >= SPAWN_FAILS_TO_FATAL:
                     self.events.put(
@@ -440,7 +447,8 @@ class CameraService(threading.Thread):
     def _switch_mode(self, new_mode):
         if new_mode == self.link.preview_mode:
             return
-        LOG_SVC.info("switching preview mode to %s (worker respawn)", new_mode)
+        LOG_SVC.info("switching preview to %s (restarting camera engine)",
+                     new_mode)
         self.link.kill()
         self.link.preview_mode = new_mode
         self._fast_strikes = []
@@ -453,8 +461,9 @@ class CameraService(threading.Thread):
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             targets = [c for c in range(self.num_cams)
                        if self.health[c]["state"] == "alive"]
-            LOG_SVC.info("CAPTURE start ts=%s cams=%s",
-                         timestamp, [c + 1 for c in targets])
+            LOG_SVC.info("capture started (cameras %s)",
+                         ", ".join(str(c + 1) for c in targets))
+            LOG_SVC.debug("capture ts=%s", timestamp)
             if len(targets) < 2:
                 self.events.put(("status",
                                  "Need at least 2 live cameras to shoot"))
@@ -484,9 +493,11 @@ class CameraService(threading.Thread):
                 image.save(path, "JPEG", quality=JPEG_QUALITY)
                 chown_to_invoking_user(path)
                 saved.append(path)
-                LOG_SVC.info("CAPTURE saved %s", path)
+                LOG_SVC.debug("saved %s", path)
 
             if len(saved) < 2:
+                LOG_SVC.warning("capture failed — only %d good photo(s)",
+                                len(saved))
                 self.events.put(("status", "Capture failed — only %d good "
                                  "frame(s)" % len(saved)))
                 return
@@ -502,7 +513,8 @@ class CameraService(threading.Thread):
                 self.events.put(("status", "GIF build failed: %s" % exc))
                 return
             chown_to_invoking_user(gif_path)
-            LOG_SVC.info("CAPTURE done %s", gif_path)
+            LOG_SVC.info("wigglegram saved: %s (%d photos)",
+                         os.path.basename(gif_path), len(saved))
             self.events.put(("gif_ready", gif_path))
         finally:
             self.events.put(("progress", None))

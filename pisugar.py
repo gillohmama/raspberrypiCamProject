@@ -31,6 +31,7 @@ DOUBLE_BIT = 0x20
 POLL_INTERVAL_S = 0.5      # 2 Hz — the verified safe maximum
 BACKOFF_AFTER = 20         # consecutive failures before slowing way down
 BACKOFF_RETRY_S = 10.0
+GIVE_UP_PROBES = 5         # never seen at all -> stop polling entirely
 
 
 class PiSugarButtons(threading.Thread):
@@ -49,7 +50,7 @@ class PiSugarButtons(threading.Thread):
             if os.path.exists(SOCKET_PATH):
                 self._socket_loop()
             else:
-                LOG.info("pisugar-server socket not found — using I2C polling")
+                LOG.debug("pisugar-server socket not found — probing I2C")
                 self._i2c_loop()
         except Exception as exc:
             LOG.error("button monitor died: %s — keyboard input only",
@@ -107,17 +108,19 @@ class PiSugarButtons(threading.Thread):
             import smbus2
             bus = smbus2.SMBus(I2C_BUS)
         except Exception as exc:
-            LOG.error("I2C unavailable (%s) — keyboard input only", exc)
+            LOG.info("no PiSugar (%s) — SPACE key is the shutter", exc)
             return
 
-        LOG.info("polling PiSugar at 0x%02X reg 0x%02X, max %.1f Hz",
-                 PISUGAR_ADDR, BTN_REG, 1.0 / POLL_INTERVAL_S)
+        seen = False
         consec_fail = 0
         while self._running:
             try:
                 val = bus.read_byte_data(PISUGAR_ADDR, BTN_REG)
-                if consec_fail >= BACKOFF_AFTER:
+                if not seen:
+                    LOG.info("PiSugar button ready")
+                elif consec_fail >= BACKOFF_AFTER:
                     LOG.info("PiSugar responding again")
+                seen = True
                 consec_fail = 0
                 # Tap flags latch until cleared: write the value back with
                 # the handled bits masked off.
@@ -131,18 +134,23 @@ class PiSugarButtons(threading.Thread):
                     self._post("single")
             except OSError as exc:
                 consec_fail += 1
-                if consec_fail < BACKOFF_AFTER:
-                    LOG.warning("I2C read failed (%d/%d): %s",
-                                consec_fail, BACKOFF_AFTER, exc)
+                LOG.debug("PiSugar read failed (%d): %s", consec_fail, exc)
+                if not seen:
+                    # Not fitted at all — one console line, then stop
+                    # touching the bus for good.
+                    if consec_fail >= GIVE_UP_PROBES:
+                        LOG.info("no PiSugar detected — SPACE key is the shutter")
+                        break
                     self._sleep(0.5)
-                else:
-                    # Absent, powered off, or sulking — stop hammering the
-                    # bus; its NACK storms must never take the cameras down.
+                elif consec_fail >= BACKOFF_AFTER:
+                    # It was there and vanished — keep retrying, gently and
+                    # quietly; its NACK storms must never wedge the bus.
                     if consec_fail == BACKOFF_AFTER:
-                        LOG.warning("PiSugar not responding — slowing to one "
-                                    "probe per %.0f s (check i2cdetect -y 1)",
-                                    BACKOFF_RETRY_S)
+                        LOG.warning("PiSugar stopped responding — retrying "
+                                    "quietly every %.0f s", BACKOFF_RETRY_S)
                     self._sleep(BACKOFF_RETRY_S)
+                else:
+                    self._sleep(0.5)
             self._sleep(POLL_INTERVAL_S)
         try:
             bus.close()
