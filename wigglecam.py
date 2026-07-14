@@ -109,9 +109,11 @@ class App:
     def __init__(self, args):
         self.events = queue.Queue()
         self.pics_dir = resolve_pics_dir()
+        self.view = args.view
         self.display = ui.DisplayManager(args.num_cams, windowed=args.windowed)
         self.service = CameraService(args.num_cams, args.preview_mode,
-                                     self.pics_dir, self.events)
+                                     self.pics_dir, self.events,
+                                     view=args.view)
         self.buttons = PiSugarButtons(self.events)
         self.mode = self.MODE_LIVE
         self.latest_gif = self._find_latest_gif()
@@ -145,7 +147,9 @@ class App:
             if self.mode == self.MODE_LIVE:
                 self.display.draw_viewfinder(self.service.get_frames(),
                                              self.service.get_health(),
-                                             self.service.preview_mode)
+                                             self.service.preview_mode,
+                                             self.view,
+                                             self.service.live_cam)
             else:
                 self.display.draw_playback()
             clock.tick(30)
@@ -163,6 +167,10 @@ class App:
             # Touchscreen taps arrive as mouse clicks.
             if self.mode == self.MODE_PLAYBACK:
                 self.display.adjust_speed(faster=event.pos[0] >= ui.SCREEN_W // 2)
+            elif self.view == "live":
+                cam = self.display.hit_thumbnail(event.pos)
+                if cam is not None:
+                    self.service.set_live_cam(cam)
 
     def _handle_key(self, key):
         if key == pygame.K_ESCAPE:
@@ -177,6 +185,13 @@ class App:
                 self._enter_playback()
         elif key == pygame.K_f:
             self.service.toggle_mode()
+        elif key == pygame.K_v:
+            self.view = "grid" if self.view == "live" else "live"
+            self.service.set_view(self.view)
+            self.display.set_status("View: %s" % self.view.upper(), 2)
+        elif key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
+            if self.mode == self.MODE_LIVE:
+                self.service.set_live_cam(key - pygame.K_1)
         elif key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
             if self.mode == self.MODE_PLAYBACK:
                 self.display.adjust_speed(faster=True)
@@ -257,6 +272,9 @@ def main():
                         default="fast",
                         help="fast keeps the stream running across mux "
                              "switches; safe reconfigures per frame")
+    parser.add_argument("--view", choices=("live", "grid"), default="live",
+                        help="live streams one camera near-real-time with "
+                             "thumbnails; grid round-robins all cameras")
     parser.add_argument("--windowed", action="store_true",
                         help="don't go fullscreen (development)")
     args = parser.parse_args()

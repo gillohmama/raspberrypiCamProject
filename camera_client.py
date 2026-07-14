@@ -36,6 +36,7 @@ QUIT_TIMEOUT_S = 2.0
 RESPAWN_DELAY_S = 1.0            # let the kernel release /dev/video* first
 
 DEAD_RETRY_INTERVAL_S = 30.0
+THUMB_REFRESH_S = 10.0           # live view: background-camera refresh cadence
 TIMEOUTS_TO_DEAD = 2             # consecutive worker-killing failures
 SOFT_FAILS_TO_DEAD = 3           # consecutive in-worker errors
 FAST_STRIKES_TO_DEMOTE = 3       # worker deaths in fast mode ...
@@ -199,13 +200,20 @@ class WorkerLink:
 class CameraService(threading.Thread):
     """Preview pump, capture sequencer and camera health tracker."""
 
-    def __init__(self, num_cams, preview_mode, pics_dir, events):
+    def __init__(self, num_cams, preview_mode, pics_dir, events, view="live"):
         super().__init__(daemon=True, name="camera-service")
         self.num_cams = num_cams
         self.pics_dir = pics_dir
         self.events = events              # shared queue.Queue to the UI
         self.link = WorkerLink(preview_mode)
         self.capturing = False
+        # "live": stream one camera continuously (no mux switches between
+        # frames -> near-real-time), refresh the rest every THUMB_REFRESH_S.
+        # "grid": round-robin everything (a mux switch per frame, ~1 Hz/cam).
+        self.view = view
+        self.live_cam = 0
+        self._last_thumb_refresh = 0.0
+        self._thumb_rr = 0
         self.health = {c: {"state": "alive", "timeouts": 0, "soft": 0,
                            "last_retry": 0.0} for c in range(num_cams)}
         self._frames = {}                 # cam -> (seq, w, h, rgb_bytes)
@@ -242,6 +250,20 @@ class CameraService(threading.Thread):
     def toggle_mode(self):
         new = "safe" if self.link.preview_mode == "fast" else "fast"
         self._ctrl.put(("mode", new))
+
+    def set_view(self, view):
+        self.view = view
+        LOG_SVC.info("view -> %s", view)
+
+    def set_live_cam(self, cam):
+        if not 0 <= cam < self.num_cams or cam == self.live_cam:
+            return
+        if self.health[cam]["state"] != "alive":
+            self.events.put(("status", "Camera %d is offline" % (cam + 1)))
+            return
+        self.live_cam = cam
+        LOG_SVC.info("live camera -> %d", cam + 1)
+        self.events.put(("status", "Live view: camera %d" % (cam + 1)))
 
     def stop(self):
         self._running = False
@@ -290,11 +312,31 @@ class CameraService(threading.Thread):
                 h["last_retry"] = now
                 LOG_SVC.info("retrying dead cam %d", c + 1)
                 return c
-        for _ in range(self.num_cams):
-            self._rr = (self._rr + 1) % self.num_cams
-            if self.health[self._rr]["state"] == "alive":
-                return self._rr
-        return None
+        alive = [c for c in range(self.num_cams)
+                 if self.health[c]["state"] == "alive"]
+        if not alive:
+            return None
+        if self.view != "live":
+            for _ in range(self.num_cams):
+                self._rr = (self._rr + 1) % self.num_cams
+                if self.health[self._rr]["state"] == "alive":
+                    return self._rr
+            return None
+        # Live view: stream the live camera; steal a slot for one background
+        # camera every THUMB_REFRESH_S (that costs two mux switches, hence
+        # the deliberately long cadence).
+        if self.live_cam not in alive:
+            self.live_cam = alive[0]
+            LOG_SVC.info("live camera died — switching to cam %d",
+                         self.live_cam + 1)
+            self.events.put(("status",
+                             "Live view: camera %d" % (self.live_cam + 1)))
+        others = [c for c in alive if c != self.live_cam]
+        if others and now - self._last_thumb_refresh >= THUMB_REFRESH_S:
+            self._last_thumb_refresh = now
+            self._thumb_rr = (self._thumb_rr + 1) % len(others)
+            return others[self._thumb_rr]
+        return self.live_cam
 
     def _preview_tick(self):
         cam = self._pick_cam()

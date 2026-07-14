@@ -22,6 +22,9 @@ MAX_FRAME_MS = 1000
 DEFAULT_FRAME_MS = 150
 SPEED_STEP = 1.25
 
+THUMB_W, THUMB_H = 144, 81      # 16:9 like the preview frames
+THUMB_MARGIN = 8
+
 BG = (12, 12, 16)
 TILE_BG = (24, 24, 30)
 TILE_DEAD_BG = (56, 14, 14)
@@ -46,8 +49,10 @@ class DisplayManager:
         self.num_cams = num_cams
         self.font = pygame.font.Font(None, 24)
         self.font_big = pygame.font.Font(None, 44)
+        self.font_small = pygame.font.Font(None, 18)
         self.tiles, self.info_rect = self._layout(num_cams)
         self._tile_cache = {}          # cam -> (seq, scaled surface)
+        self._thumb_hits = []          # [(rect, cam)] from the last live draw
         self.status_msg = ""
         self.status_until = 0.0
         self.progress_msg = None       # sticky banner while capturing
@@ -104,20 +109,71 @@ class DisplayManager:
 
     # ---------------------------------------------------------- viewfinder
 
-    def draw_viewfinder(self, frames, health, preview_mode):
+    def draw_viewfinder(self, frames, health, preview_mode,
+                        view="grid", live_cam=0):
         self.screen.fill(BG)
-        for cam, rect in enumerate(self.tiles):
-            self._draw_tile(cam, rect, frames.get(cam),
-                            health.get(cam, "alive"))
-        if self.info_rect is not None:
-            self._draw_info_panel(self.info_rect, preview_mode)
+        if view == "live":
+            self._draw_live(frames, health, live_cam)
+        else:
+            for cam, rect in enumerate(self.tiles):
+                self._draw_tile(cam, rect, frames.get(cam),
+                                health.get(cam, "alive"))
+            if self.info_rect is not None:
+                self._draw_info_panel(self.info_rect, preview_mode)
         if self.progress_msg:
             self._draw_banner(self.progress_msg)
         self._draw_status_bar(health, preview_mode)
         pygame.display.flip()
 
-    def _draw_tile(self, cam, rect, frame, state):
+    def _draw_live(self, frames, health, live_cam):
+        area = pygame.Rect(0, 0, SCREEN_W, SCREEN_H - STATUS_H)
+        self._draw_tile(live_cam, area, frames.get(live_cam),
+                        health.get(live_cam, "alive"), live=True)
+        self._thumb_hits = []
+        y = area.bottom - THUMB_MARGIN - THUMB_H
+        for cam in range(self.num_cams):
+            if cam == live_cam:
+                continue
+            rect = pygame.Rect(SCREEN_W - THUMB_MARGIN - THUMB_W, y,
+                               THUMB_W, THUMB_H)
+            self._draw_thumb(cam, rect, frames.get(cam),
+                             health.get(cam, "alive"))
+            self._thumb_hits.append((rect, cam))
+            y -= THUMB_H + THUMB_MARGIN
+
+    def _draw_thumb(self, cam, rect, frame, state):
+        alive = state == "alive"
+        if not alive:
+            pygame.draw.rect(self.screen, TILE_DEAD_BG, rect)
+        elif frame is None:
+            pygame.draw.rect(self.screen, TILE_BG, rect)
+        else:
+            seq, w, h, data = frame
+            cached = self._tile_cache.get(cam)
+            if (cached is None or cached[0] != seq
+                    or cached[1].get_size() != rect.size):
+                surf = pygame.image.frombuffer(data, (w, h), "RGB")
+                surf = pygame.transform.smoothscale(surf, rect.size)
+                self._tile_cache[cam] = (seq, surf)
+            self.screen.blit(self._tile_cache[cam][1], rect)
+        pygame.draw.rect(self.screen,
+                         (200, 200, 200) if alive else TEXT_BAD, rect, 1)
+        label = "%d (%s)%s" % (cam + 1, PORT_LETTERS[cam],
+                               "" if alive else " OFF")
+        self._text(label, TEXT if alive else TEXT_BAD, font=self.font_small,
+                   topleft=(rect.x + 4, rect.y + 3))
+
+    def hit_thumbnail(self, pos):
+        """Camera index of the thumbnail under a tap, or None."""
+        for rect, cam in self._thumb_hits:
+            if rect.collidepoint(pos):
+                return cam
+        return None
+
+    def _draw_tile(self, cam, rect, frame, state, live=False):
         label = "cam%d (%s)" % (cam + 1, PORT_LETTERS[cam])
+        if live:
+            label = "LIVE  " + label
         if state == "dead":
             pygame.draw.rect(self.screen, TILE_DEAD_BG, rect)
             self._text("%s OFFLINE" % label, TEXT_BAD, center_in=rect)
@@ -133,12 +189,18 @@ class DisplayManager:
             if (cached is None or cached[0] != seq
                     or cached[1].get_size() != dest.size):
                 surf = pygame.image.frombuffer(data, (w, h), "RGB")
-                surf = pygame.transform.smoothscale(surf, dest.size)
+                # The live view is screen-native (800x450) — skip the scale.
+                if dest.size != (w, h):
+                    surf = pygame.transform.smoothscale(surf, dest.size)
                 self._tile_cache[cam] = (seq, surf)
             if dest.size != rect.size:
                 pygame.draw.rect(self.screen, TILE_BG, rect)
             self.screen.blit(self._tile_cache[cam][1], dest)
-        self._text(label, (255, 255, 255), topleft=(rect.x + 6, rect.y + 4))
+        surf = self.font.render(label, True, (255, 255, 255))
+        backing = pygame.Rect(rect.x, rect.y,
+                              surf.get_width() + 12, surf.get_height() + 8)
+        pygame.draw.rect(self.screen, PANEL_BG, backing)
+        self.screen.blit(surf, (rect.x + 6, rect.y + 4))
 
     def _draw_info_panel(self, rect, preview_mode):
         pygame.draw.rect(self.screen, PANEL_BG, rect)
@@ -148,6 +210,8 @@ class DisplayManager:
             ("", TEXT_DIM),
             ("tap / SPACE      shoot", TEXT_DIM),
             ("2x tap / G       play GIF", TEXT_DIM),
+            ("V                live/grid view", TEXT_DIM),
+            ("1-4              live camera", TEXT_DIM),
             ("F                preview mode", TEXT_DIM),
             ("ESC              quit", TEXT_DIM),
         ]

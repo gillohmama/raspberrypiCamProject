@@ -65,7 +65,9 @@ MUX_SETTLE_S = 0.2     # mux settle after a completed switch
 # libcamera names pixel formats DRM-style: "BGR888" is R,G,B in memory,
 # which is what PIL and pygame expect. ("RGB888" would be B,G,R.)
 PIXEL_FORMAT = "BGR888"
-PREVIEW_SIZE = (640, 360)
+# Native size of the screen's viewfinder area, so the fullscreen live view
+# needs no upscaling. ~1.1 MB per frame over the pipe — trivial.
+PREVIEW_SIZE = (800, 450)
 STILL_SIZE = (1920, 1080)
 
 AE_SETTLE_PREVIEW_S = 0.30   # exposure convergence before a preview grab

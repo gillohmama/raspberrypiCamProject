@@ -22,6 +22,8 @@ sudo python3 wigglecam.py 3 --preview-mode safe
 | Play latest GIF         | double tap     | G        | —     |
 | (playback) slower/faster| —              | - / +    | left / right half |
 | (playback) back to live | single tap     | G        | —     |
+| Switch live camera      | —              | 1–4      | tap a thumbnail |
+| Toggle live/grid view   | —              | V        | —     |
 | Toggle preview fast/safe| —              | F        | —     |
 | Quit                    | —              | ESC      | —     |
 
@@ -69,10 +71,25 @@ row mark it dead. Dead cameras show as offline tiles, get one retry every
 30 s, and are skipped during capture (a GIF is still built from ≥2 good
 frames). A flaky ribbon on one port never blocks the others.
 
+### Viewfinder views
+
+Every tile refresh costs a mux switch (~0.2 s verified settle + frame
+flushes), so refreshing *all* tiles fast is physically impossible. Instead:
+
+- **live** (default): ONE camera streams continuously — no mux switching
+  between frames at all, so it runs at ~15–25 fps, like a real camera.
+  The other cameras appear as corner thumbnails refreshed round-robin every
+  ~10 s (each refresh is two mux switches, hence a brief hitch — rare by
+  design). Tap a thumbnail or press 1–4 to change the live camera; if the
+  live camera dies, the view hops to the next healthy one.
+- **grid** (V key / `--view grid`): all cameras round-robin, each tile
+  refreshing every ~1 s in fast mode. Useful for checking all ports at once.
+
 ### Preview strategies
 
 - **fast** (default): the stream keeps running; the mux is switched live, two
-  stale frames are flushed, the next is used. ~0.3 s per frame.
+  stale frames are flushed, the next is used. ~0.3 s per switched frame; in
+  live view (no switching) it's whatever the pipe sustains, ~15–25 fps.
 - **safe**: full stop → switch → configure → start → settle → capture → stop
   per frame (~0.6 s), the proven-reliable old method.
 
