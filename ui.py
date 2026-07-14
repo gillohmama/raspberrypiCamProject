@@ -6,6 +6,7 @@ no pygame 2 flags, default font only, frombuffer with "RGB".
 """
 
 import logging
+import math
 import time
 
 import pygame
@@ -24,6 +25,12 @@ SPEED_STEP = 1.25
 
 THUMB_W, THUMB_H = 144, 81      # 16:9 like the preview frames
 THUMB_MARGIN = 8
+
+# On-screen shutter button, top-left corner. Tap = shoot; hold = the pie
+# fills like a clock and the gallery opens; in the gallery it's the back
+# button.
+SHUTTER_CENTER = (48, 48)
+SHUTTER_R = 36
 
 BG = (12, 12, 16)
 TILE_BG = (24, 24, 30)
@@ -110,36 +117,44 @@ class DisplayManager:
     # ---------------------------------------------------------- viewfinder
 
     def draw_viewfinder(self, frames, health, preview_mode,
-                        view="grid", live_cam=0):
+                        view="grid", live_cam=0, hold_progress=0.0):
         self.screen.fill(BG)
         if view == "live":
             self._draw_live(frames, health, live_cam)
         else:
             for cam, rect in enumerate(self.tiles):
+                label_pos = None
+                if rect.topleft == (0, 0):   # make room for the button
+                    label_pos = (SHUTTER_CENTER[0] + SHUTTER_R + 10, rect.y + 4)
                 self._draw_tile(cam, rect, frames.get(cam),
-                                health.get(cam, "alive"))
+                                health.get(cam, "alive"), label_pos=label_pos)
             if self.info_rect is not None:
                 self._draw_info_panel(self.info_rect, preview_mode)
         if self.progress_msg:
             self._draw_banner(self.progress_msg)
         self._draw_status_bar(health, preview_mode)
+        self._draw_shutter(hold_progress)
         pygame.display.flip()
 
     def _draw_live(self, frames, health, live_cam):
         area = pygame.Rect(0, 0, SCREEN_W, SCREEN_H - STATUS_H)
         self._draw_tile(live_cam, area, frames.get(live_cam),
-                        health.get(live_cam, "alive"), live=True)
+                        health.get(live_cam, "alive"), live=True,
+                        label_pos=(SHUTTER_CENTER[0] + SHUTTER_R + 10, 10))
+        # The other cameras take the free corners (top-left is the button's).
+        corners = [
+            (SCREEN_W - THUMB_MARGIN - THUMB_W, THUMB_MARGIN),
+            (SCREEN_W - THUMB_MARGIN - THUMB_W,
+             area.bottom - THUMB_MARGIN - THUMB_H),
+            (THUMB_MARGIN, area.bottom - THUMB_MARGIN - THUMB_H),
+        ]
+        others = [c for c in range(self.num_cams) if c != live_cam]
         self._thumb_hits = []
-        y = area.bottom - THUMB_MARGIN - THUMB_H
-        for cam in range(self.num_cams):
-            if cam == live_cam:
-                continue
-            rect = pygame.Rect(SCREEN_W - THUMB_MARGIN - THUMB_W, y,
-                               THUMB_W, THUMB_H)
+        for corner, cam in zip(corners, others):
+            rect = pygame.Rect(corner, (THUMB_W, THUMB_H))
             self._draw_thumb(cam, rect, frames.get(cam),
                              health.get(cam, "alive"))
             self._thumb_hits.append((rect, cam))
-            y -= THUMB_H + THUMB_MARGIN
 
     def _draw_thumb(self, cam, rect, frame, state):
         alive = state == "alive"
@@ -170,7 +185,38 @@ class DisplayManager:
                 return cam
         return None
 
-    def _draw_tile(self, cam, rect, frame, state, live=False):
+    def hit_shutter(self, pos):
+        """True if a tap landed on the shutter/back button (finger-sized slop)."""
+        dx = pos[0] - SHUTTER_CENTER[0]
+        dy = pos[1] - SHUTTER_CENTER[1]
+        return dx * dx + dy * dy <= (SHUTTER_R + 10) ** 2
+
+    def _draw_shutter(self, hold_progress=0.0, back=False):
+        center = SHUTTER_CENTER
+        pygame.draw.circle(self.screen, (30, 30, 36), center, SHUTTER_R)
+        pygame.draw.circle(self.screen, (235, 235, 235), center, SHUTTER_R, 2)
+        if back:
+            points = [(center[0] + 10, center[1] - 14),
+                      (center[0] + 10, center[1] + 14),
+                      (center[0] - 14, center[1])]
+            pygame.draw.polygon(self.screen, (235, 235, 235), points)
+        else:
+            pygame.draw.circle(self.screen, (235, 235, 235), center, 14)
+        if hold_progress > 0.0:
+            self._draw_hold_pie(center, SHUTTER_R - 6, min(1.0, hold_progress))
+
+    def _draw_hold_pie(self, center, radius, progress):
+        """Clock-wipe: a filled pie from 12 o'clock sweeping clockwise."""
+        steps = max(2, int(progress * 48))
+        points = [center]
+        sweep = progress * 2.0 * math.pi
+        for i in range(steps + 1):
+            angle = -math.pi / 2 + sweep * i / steps
+            points.append((int(center[0] + radius * math.cos(angle)),
+                           int(center[1] + radius * math.sin(angle))))
+        pygame.draw.polygon(self.screen, (255, 200, 60), points)
+
+    def _draw_tile(self, cam, rect, frame, state, live=False, label_pos=None):
         label = "cam%d (%s)" % (cam + 1, PORT_LETTERS[cam])
         if live:
             label = "LIVE  " + label
@@ -197,10 +243,11 @@ class DisplayManager:
                 pygame.draw.rect(self.screen, TILE_BG, rect)
             self.screen.blit(self._tile_cache[cam][1], dest)
         surf = self.font.render(label, True, (255, 255, 255))
-        backing = pygame.Rect(rect.x, rect.y,
+        lx, ly = label_pos if label_pos else (rect.x + 6, rect.y + 4)
+        backing = pygame.Rect(lx - 6, ly - 4,
                               surf.get_width() + 12, surf.get_height() + 8)
         pygame.draw.rect(self.screen, PANEL_BG, backing)
-        self.screen.blit(surf, (rect.x + 6, rect.y + 4))
+        self.screen.blit(surf, (lx, ly))
 
     def _draw_info_panel(self, rect, preview_mode):
         pygame.draw.rect(self.screen, PANEL_BG, rect)
@@ -208,8 +255,8 @@ class DisplayManager:
             ("WIGGLECAM", TEXT),
             ("preview: %s" % preview_mode.upper(), TEXT_MODE),
             ("", TEXT_DIM),
-            ("tap / SPACE      shoot", TEXT_DIM),
-            ("2x tap / G       play GIF", TEXT_DIM),
+            ("button / SPACE   shoot", TEXT_DIM),
+            ("hold button / G  gallery", TEXT_DIM),
             ("V                live/grid view", TEXT_DIM),
             ("1-4              live camera", TEXT_DIM),
             ("F                preview mode", TEXT_DIM),
@@ -264,7 +311,7 @@ class DisplayManager:
         self._gif_next_t = 0.0
         LOG.debug("loaded %s (%d frames)", path, len(frames))
 
-    def draw_playback(self):
+    def draw_gallery(self, index, total):
         now = time.time()
         if now >= self._gif_next_t:
             self._gif_idx = (self._gif_idx + 1) % len(self.gif_frames)
@@ -273,12 +320,16 @@ class DisplayManager:
         frame = self.gif_frames[self._gif_idx]
         self.screen.blit(frame,
                          frame.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2)))
+        header = pygame.Rect(0, 8, SCREEN_W, 24)
+        self._text("%d / %d" % (index + 1, total), TEXT, center_in=header)
         if now < self._speed_flash_until:
             flash = pygame.Rect(0, SCREEN_H - 70, SCREEN_W, 50)
             self._text("%d ms/frame" % self.frame_ms, TEXT_FLASH,
                        font=self.font_big, center_in=flash)
         if now < self.status_until and self.status_msg:
-            self._text(self.status_msg, TEXT, topleft=(8, 8))
+            below = pygame.Rect(0, 34, SCREEN_W, 24)
+            self._text(self.status_msg, TEXT, center_in=below)
+        self._draw_shutter(back=True)
         pygame.display.flip()
 
     def adjust_speed(self, faster):

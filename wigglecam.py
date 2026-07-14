@@ -33,6 +33,9 @@ RESTART_ENV = "WIGGLECAM_RESTARTS"
 MAX_RESTARTS = 5
 RESTART_WINDOW_S = 900
 
+HOLD_TO_GALLERY_S = 1.0      # hold the shutter button this long -> gallery
+SWIPE_PX = 60                # horizontal travel that counts as a swipe
+
 
 def resolve_pics_dir():
     """~/piCameraPics for the *invoking* user (the app runs under sudo)."""
@@ -118,7 +121,7 @@ def self_restart(reason):
 
 class App:
     MODE_LIVE = "live"
-    MODE_PLAYBACK = "playback"
+    MODE_GALLERY = "gallery"
 
     def __init__(self, args):
         self.events = queue.Queue()
@@ -130,18 +133,15 @@ class App:
                                      view=args.view)
         self.buttons = PiSugarButtons(self.events)
         self.mode = self.MODE_LIVE
-        self.latest_gif = self._find_latest_gif()
+        self.gifs = []               # gallery contents, newest first
+        self.gif_idx = 0
         self.running = True
         self.fatal_reason = None
-
-    def _find_latest_gif(self):
-        try:
-            gifs = [os.path.join(self.pics_dir, name)
-                    for name in os.listdir(self.pics_dir)
-                    if name.endswith("_wigglegram.gif")]
-            return max(gifs, key=os.path.getmtime) if gifs else None
-        except Exception:
-            return None
+        # touch state for the on-screen button and swipes
+        self._btn_held = False
+        self._hold_done = False
+        self._down_pos = None
+        self._down_t = 0.0
 
     # ---------------------------------------------------------------- run
 
@@ -149,13 +149,13 @@ class App:
         self.service.start()
         self.buttons.start()
         LOG.info("ready — photos will be saved to %s", self.pics_dir)
-        LOG.debug("latest gif: %s", self.latest_gif)
         self.display.set_status("Ready — tap the button or SPACE to shoot", 5)
         clock = pygame.time.Clock()
         while self.running:
             for event in pygame.event.get():
                 self._handle_pygame_event(event)
             self._drain_events()
+            hold = self._update_hold()
             if self.fatal_reason:
                 break
             if self.mode == self.MODE_LIVE:
@@ -163,11 +163,24 @@ class App:
                                              self.service.get_health(),
                                              self.service.preview_mode,
                                              self.view,
-                                             self.service.live_cam)
+                                             self.service.live_cam,
+                                             hold)
             else:
-                self.display.draw_playback()
+                self.display.draw_gallery(self.gif_idx, len(self.gifs))
             clock.tick(30)
         return self.fatal_reason
+
+    def _update_hold(self):
+        """Progress (0..1) of a shutter-button hold; opens the gallery when
+        the clock animation completes."""
+        if not self._btn_held or self._hold_done or self.mode != self.MODE_LIVE:
+            return 0.0
+        elapsed = time.time() - self._down_t
+        if elapsed >= HOLD_TO_GALLERY_S:
+            self._hold_done = True
+            self._enter_gallery()
+            return 0.0
+        return elapsed / HOLD_TO_GALLERY_S
 
     # -------------------------------------------------------------- events
 
@@ -179,12 +192,40 @@ class App:
             self._handle_key(event.key)
         elif event.type == pygame.MOUSEBUTTONDOWN:
             # Touchscreen taps arrive as mouse clicks.
-            if self.mode == self.MODE_PLAYBACK:
-                self.display.adjust_speed(faster=event.pos[0] >= ui.SCREEN_W // 2)
-            elif self.view == "live":
-                cam = self.display.hit_thumbnail(event.pos)
-                if cam is not None:
-                    self.service.set_live_cam(cam)
+            self._on_touch_down(event.pos)
+        elif event.type == pygame.MOUSEBUTTONUP:
+            self._on_touch_up(event.pos)
+
+    def _on_touch_down(self, pos):
+        self._down_pos = pos
+        self._down_t = time.time()
+        if self.display.hit_shutter(pos):
+            self._btn_held = True
+            self._hold_done = False
+        elif self.mode == self.MODE_LIVE and self.view == "live":
+            cam = self.display.hit_thumbnail(pos)
+            if cam is not None:
+                self.service.set_live_cam(cam)
+
+    def _on_touch_up(self, pos):
+        was_held, self._btn_held = self._btn_held, False
+        down_pos, self._down_pos = self._down_pos, None
+        if was_held:
+            if self._hold_done:      # gallery already opened by the hold
+                self._hold_done = False
+                return
+            if self.mode == self.MODE_GALLERY:
+                self._exit_gallery()
+            else:
+                self.service.request_capture()
+            return
+        if self.mode != self.MODE_GALLERY or down_pos is None:
+            return
+        dx = pos[0] - down_pos[0]
+        if abs(dx) >= SWIPE_PX:
+            self._gallery_nav(1 if dx < 0 else -1)   # swipe left = older
+        else:
+            self.display.adjust_speed(faster=pos[0] >= ui.SCREEN_W // 2)
 
     def _handle_key(self, key):
         if key == pygame.K_ESCAPE:
@@ -193,10 +234,16 @@ class App:
         elif key == pygame.K_SPACE:
             self._shutter()
         elif key == pygame.K_g:
-            if self.mode == self.MODE_PLAYBACK:
-                self._exit_playback()
+            if self.mode == self.MODE_GALLERY:
+                self._exit_gallery()
             else:
-                self._enter_playback()
+                self._enter_gallery()
+        elif key == pygame.K_LEFT:
+            if self.mode == self.MODE_GALLERY:
+                self._gallery_nav(-1)
+        elif key == pygame.K_RIGHT:
+            if self.mode == self.MODE_GALLERY:
+                self._gallery_nav(1)
         elif key == pygame.K_f:
             self.service.toggle_mode()
         elif key == pygame.K_v:
@@ -207,10 +254,10 @@ class App:
             if self.mode == self.MODE_LIVE:
                 self.service.set_live_cam(key - pygame.K_1)
         elif key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
-            if self.mode == self.MODE_PLAYBACK:
+            if self.mode == self.MODE_GALLERY:
                 self.display.adjust_speed(faster=True)
         elif key in (pygame.K_MINUS, pygame.K_KP_MINUS):
-            if self.mode == self.MODE_PLAYBACK:
+            if self.mode == self.MODE_GALLERY:
                 self.display.adjust_speed(faster=False)
 
     def _drain_events(self):
@@ -224,9 +271,8 @@ class App:
             elif kind == "progress":
                 self.display.set_progress(arg)
             elif kind == "gif_ready":
-                self.latest_gif = arg
                 self.display.set_status("Saved %s" % os.path.basename(arg), 4)
-                self._enter_playback()   # show off the result right away
+                self._enter_gallery()   # newest first — shows the new one
             elif kind == "button":
                 self._handle_button(arg)
             elif kind == "fatal":
@@ -236,32 +282,59 @@ class App:
         if kind == "single":
             self._shutter()
         elif kind == "double":
-            self._enter_playback()
+            self._enter_gallery()
         else:
             LOG.info("long tap — no action bound")
 
     # -------------------------------------------------------------- actions
 
     def _shutter(self):
-        if self.mode == self.MODE_PLAYBACK:
-            self._exit_playback()
+        if self.mode == self.MODE_GALLERY:
+            self._exit_gallery()
         else:
             self.service.request_capture()
 
-    def _enter_playback(self):
-        if not self.latest_gif or not os.path.exists(self.latest_gif):
+    def _scan_gifs(self):
+        """All wigglegrams on disk, newest first."""
+        try:
+            gifs = [os.path.join(self.pics_dir, name)
+                    for name in os.listdir(self.pics_dir)
+                    if name.endswith("_wigglegram.gif")]
+            gifs.sort(key=os.path.getmtime, reverse=True)
+            return gifs
+        except Exception:
+            return []
+
+    def _enter_gallery(self):
+        self.gifs = self._scan_gifs()
+        if not self.gifs:
             self.display.set_status("No wigglegrams yet — shoot one first")
             return
-        try:
-            self.display.load_gif(self.latest_gif)
-        except Exception as exc:
-            LOG.error("cannot load %s: %s", self.latest_gif, exc)
-            self.display.set_status("GIF load failed")
-            return
-        self.mode = self.MODE_PLAYBACK
+        self.gif_idx = 0
+        if self._show_gif():
+            self.mode = self.MODE_GALLERY
 
-    def _exit_playback(self):
+    def _exit_gallery(self):
         self.mode = self.MODE_LIVE
+
+    def _show_gif(self):
+        path = self.gifs[self.gif_idx]
+        try:
+            self.display.load_gif(path)
+            return True
+        except Exception as exc:
+            LOG.error("cannot load %s: %s", path, exc)
+            self.display.set_status("GIF load failed")
+            return False
+
+    def _gallery_nav(self, step):
+        new_idx = max(0, min(len(self.gifs) - 1, self.gif_idx + step))
+        if new_idx == self.gif_idx:
+            return
+        previous = self.gif_idx
+        self.gif_idx = new_idx
+        if not self._show_gif():
+            self.gif_idx = previous
 
     # ------------------------------------------------------------- cleanup
 

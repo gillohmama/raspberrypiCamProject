@@ -16,12 +16,19 @@ sudo python3 wigglecam.py 3 --preview-mode safe
 
 ## Controls
 
+A round shutter button sits in the top-left corner of the screen; the other
+cameras' thumbnails occupy the remaining corners. Holding the button fills a
+clock-style ring — when the circle completes, the gallery opens with every
+wigglegram on the device (newest first), each playing its loop. The same
+button (now a back arrow) returns to the camera.
+
 | Action                  | PiSugar button | Keyboard | Touch |
 |-------------------------|----------------|----------|-------|
-| Capture wigglegram      | single tap     | SPACE    | —     |
-| Play latest GIF         | double tap     | G        | —     |
-| (playback) slower/faster| —              | - / +    | left / right half |
-| (playback) back to live | single tap     | G        | —     |
+| Capture wigglegram      | single tap     | SPACE    | tap the button |
+| Open gallery            | double tap     | G        | hold the button ~1 s |
+| (gallery) older / newer | —              | → / ←    | swipe left / right |
+| (gallery) slower/faster | —              | - / +    | tap left / right half |
+| (gallery) back to camera| single tap     | G        | tap the button |
 | Switch live camera      | —              | 1–4      | tap a thumbnail |
 | Toggle live/grid view   | —              | V        | —     |
 | Toggle preview fast/safe| —              | F        | —     |
