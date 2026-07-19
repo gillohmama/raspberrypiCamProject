@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Wigglegram camera — entrypoint.
 
-    sudo python3 wigglecam.py 3                 # cameras on ports A, B, C
-    sudo python3 wigglecam.py 3 --preview-mode safe
-    sudo python3 wigglecam.py 4 --windowed      # development
+    sudo python3 wigglecam.py                   # all 4 ports (the default)
+    sudo python3 wigglecam.py 3                 # only ports A, B, C
+    sudo python3 wigglecam.py --preview-mode safe
+    sudo python3 wigglecam.py --windowed        # development
 
 See README.md for the architecture. This process runs the UI and
 supervises the camera worker; if the camera stack becomes unrecoverable
@@ -352,7 +353,7 @@ class App:
 
 def main():
     parser = argparse.ArgumentParser(description="Wigglegram camera")
-    parser.add_argument("num_cams", nargs="?", type=int, default=3,
+    parser.add_argument("num_cams", nargs="?", type=int, default=4,
                         choices=(2, 3, 4),
                         help="how many cameras are connected (ports A, B, …)")
     parser.add_argument("--preview-mode", choices=("fast", "safe"),

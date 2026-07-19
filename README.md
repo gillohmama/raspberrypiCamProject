@@ -9,9 +9,9 @@ Runs on **Raspberry Pi OS Bullseye only** (the Arducam adapter does not work
 on newer releases). Python 3.9, pygame 1.9.6, apt-installed picamera2.
 
 ```
-sudo python3 wigglecam.py 3            # 3 cameras (ports A, B, C)
-sudo python3 wigglecam.py 4            # all four ports
-sudo python3 wigglecam.py 3 --preview-mode safe
+sudo python3 wigglecam.py              # all four ports (the default)
+sudo python3 wigglecam.py 3            # only ports A, B, C
+sudo python3 wigglecam.py --preview-mode safe
 ```
 
 ## Controls
