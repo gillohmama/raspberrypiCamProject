@@ -131,7 +131,7 @@ class App:
         self.display = ui.DisplayManager(args.num_cams, windowed=args.windowed)
         self.service = CameraService(args.num_cams, args.preview_mode,
                                      self.pics_dir, self.events,
-                                     view=args.view)
+                                     view=args.view, rotate=args.rotate)
         self.buttons = PiSugarButtons(self.events)
         self.mode = self.MODE_LIVE
         self.gifs = []               # gallery contents, newest first
@@ -360,6 +360,9 @@ def main():
                         default="fast",
                         help="fast keeps the stream running across mux "
                              "switches; safe reconfigures per frame")
+    parser.add_argument("--rotate", type=int, choices=(0, 180), default=180,
+                        help="camera image rotation; 180 (the default) suits "
+                             "the upside-down mounting in the case")
     parser.add_argument("--view", choices=("live", "grid"), default="live",
                         help="live streams one camera near-real-time with "
                              "thumbnails; grid round-robins all cameras")
@@ -371,8 +374,8 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.verbose)
-    LOG.info("starting — %d cameras, %s preview, %s view",
-             args.num_cams, args.preview_mode, args.view)
+    LOG.info("starting — %d cameras, %s preview, %s view, rotated %d°",
+             args.num_cams, args.preview_mode, args.view, args.rotate)
     LOG.debug("argv=%s", sys.argv)
 
     app = None

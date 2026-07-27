@@ -69,8 +69,9 @@ def chown_to_invoking_user(path):
 class WorkerLink:
     """Owns the worker subprocess and its framed pipe protocol."""
 
-    def __init__(self, preview_mode):
+    def __init__(self, preview_mode, rotate=0):
         self.preview_mode = preview_mode
+        self.rotate = rotate
         self._proc = None
         self._buf = bytearray()
 
@@ -80,7 +81,9 @@ class WorkerLink:
         LOG_LINK.debug("spawning camera worker (preview_mode=%s)", self.preview_mode)
         self._buf = bytearray()
         self._proc = subprocess.Popen(
-            [sys.executable, "-u", worker, "--preview-mode", self.preview_mode],
+            [sys.executable, "-u", worker,
+             "--preview-mode", self.preview_mode,
+             "--rotate", str(self.rotate)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, bufsize=0)
         threading.Thread(target=self._pump_stderr, args=(self._proc,),
@@ -207,12 +210,13 @@ class WorkerLink:
 class CameraService(threading.Thread):
     """Preview pump, capture sequencer and camera health tracker."""
 
-    def __init__(self, num_cams, preview_mode, pics_dir, events, view="live"):
+    def __init__(self, num_cams, preview_mode, pics_dir, events, view="live",
+                 rotate=0):
         super().__init__(daemon=True, name="camera-service")
         self.num_cams = num_cams
         self.pics_dir = pics_dir
         self.events = events              # shared queue.Queue to the UI
-        self.link = WorkerLink(preview_mode)
+        self.link = WorkerLink(preview_mode, rotate)
         self.capturing = False
         # "live": stream one camera continuously (no mux switches between
         # frames -> near-real-time), refresh the rest every THUMB_REFRESH_S.

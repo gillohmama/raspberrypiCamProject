@@ -12,7 +12,12 @@ on newer releases). Python 3.9, pygame 1.9.6, apt-installed picamera2.
 sudo python3 wigglecam.py              # all four ports (the default)
 sudo python3 wigglecam.py 3            # only ports A, B, C
 sudo python3 wigglecam.py --preview-mode safe
+sudo python3 wigglecam.py --rotate 0   # cameras mounted the right way up
 ```
+
+The cameras sit upside down in the case, so images are rotated 180° by
+default — the IMX219 does this in the sensor, at no cost. `--rotate 0`
+turns it off if they are ever remounted.
 
 ## Controls
 

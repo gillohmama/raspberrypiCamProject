@@ -37,6 +37,11 @@ import RPi.GPIO as GPIO
 import smbus2
 from picamera2 import Picamera2
 
+try:
+    from libcamera import Transform
+except ImportError:      # very old picamera2 — fall back to software rotation
+    Transform = None
+
 LOG = logging.getLogger("worker")
 
 I2C_BUS = 1
@@ -204,8 +209,13 @@ class CameraEngine:
             the parent kills us and (after enough strikes) respawns in safe.
     """
 
-    def __init__(self, preview_mode):
+    def __init__(self, preview_mode, rotate=0):
         self.preview_mode = preview_mode
+        # The cameras are mounted upside down in the case, so 180 is the
+        # normal setting. The IMX219 flips in the sensor itself (free);
+        # software rotation is only a fallback if libcamera refuses.
+        self._hw_rotate = rotate == 180 and Transform is not None
+        self._sw_rotate = rotate == 180 and Transform is None
         self.mux = MuxController()
         self.mux.select(0)
         self.picam2 = Picamera2()
@@ -216,31 +226,53 @@ class CameraEngine:
         # automatically if buffer allocation can't afford it.
         self._pin_raw = True
         self._cfg_cache = {}
-        LOG.info("camera engine ready (preview_mode=%s)", preview_mode)
+        LOG.info("camera engine ready (preview_mode=%s, rotate=%d%s)",
+                 preview_mode, rotate,
+                 ", in software" if self._sw_rotate else "")
 
-    def _config(self, kind, pin_raw):
-        key = (kind, pin_raw)
+    def _config(self, kind, pin_raw, hw_rotate):
+        key = (kind, pin_raw, hw_rotate)
         if key not in self._cfg_cache:
             main = {"size": PREVIEW_SIZE if kind == "preview" else STILL_SIZE,
                     "format": PIXEL_FORMAT}
             make = (self.picam2.create_video_configuration if kind == "preview"
                     else self.picam2.create_still_configuration)
+            kwargs = {"main": main}
             if pin_raw:
-                self._cfg_cache[key] = make(main=main, raw={"size": STILL_SIZE})
-            else:
-                self._cfg_cache[key] = make(main=main)
+                kwargs["raw"] = {"size": STILL_SIZE}
+            if hw_rotate:
+                # 180 deg == both flips; the sensor does it while reading out.
+                kwargs["transform"] = Transform(hflip=1, vflip=1)
+            self._cfg_cache[key] = make(**kwargs)
         return self._cfg_cache[key]
 
     def _configure(self, kind):
-        try:
-            self.picam2.configure(self._config(kind, self._pin_raw))
-        except Exception as exc:
-            if not self._pin_raw:
+        """Configure, degrading gracefully: drop the pinned raw mode first,
+        then the sensor flip (rotating in software instead)."""
+        while True:
+            try:
+                self.picam2.configure(
+                    self._config(kind, self._pin_raw, self._hw_rotate))
+                return
+            except Exception as exc:
+                if self._pin_raw:
+                    LOG.warning("configure with pinned raw mode failed (%s) — "
+                                "dropping raw stream; viewfinder FoV may "
+                                "differ from stills", exc)
+                    self._pin_raw = False
+                    continue
+                if self._hw_rotate:
+                    LOG.warning("configure with sensor flip failed (%s) — "
+                                "rotating frames in software instead", exc)
+                    self._hw_rotate = False
+                    self._sw_rotate = True
+                    continue
                 raise
-            LOG.warning("configure with pinned raw mode failed (%s) — dropping "
-                        "raw stream; viewfinder FoV may differ from stills", exc)
-            self._pin_raw = False
-            self.picam2.configure(self._config(kind, False))
+
+    def _oriented(self, arr):
+        # Reversing both axes is a 180 deg rotation; tobytes() later
+        # re-serialises it in C order, so the view is safe to return.
+        return arr[::-1, ::-1] if self._sw_rotate else arr
 
     def _stop_if_running(self):
         if self._running_kind is not None:
@@ -261,7 +293,7 @@ class CameraEngine:
         time.sleep(AE_SETTLE_PREVIEW_S)
         arr = self.picam2.capture_array("main")
         self._stop_if_running()
-        return arr
+        return self._oriented(arr)
 
     def _preview_fast(self, cam):
         if self._running_kind != "preview":
@@ -275,7 +307,7 @@ class CameraEngine:
             self.mux.select(cam)
             for _ in range(FAST_FLUSH_FRAMES):
                 self.picam2.capture_array("main")
-        return self.picam2.capture_array("main")
+        return self._oriented(self.picam2.capture_array("main"))
 
     def still(self, cam):
         # Stills always use the safe sequence — reliability over speed here.
@@ -288,7 +320,7 @@ class CameraEngine:
         self.picam2.capture_array("main")   # discard: AE/AWB still converging
         arr = self.picam2.capture_array("main")
         self._stop_if_running()
-        return arr
+        return self._oriented(arr)
 
     def close(self):
         self._stop_if_running()
@@ -309,6 +341,7 @@ def send(obj, payload=b""):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--preview-mode", choices=("fast", "safe"), default="fast")
+    parser.add_argument("--rotate", type=int, choices=(0, 180), default=0)
     args = parser.parse_args()
 
     # Ctrl-C on the terminal signals the whole process group; shutdown is the
@@ -318,9 +351,10 @@ def main():
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                         format="%(name)s %(levelname)s %(message)s")
 
-    LOG.info("starting (pid=%d, preview_mode=%s)", os.getpid(), args.preview_mode)
+    LOG.info("starting (pid=%d, preview_mode=%s, rotate=%d)",
+             os.getpid(), args.preview_mode, args.rotate)
     try:
-        engine = CameraEngine(args.preview_mode)
+        engine = CameraEngine(args.preview_mode, args.rotate)
     except Exception as exc:
         LOG.error("startup failed: %s", exc, exc_info=True)
         try:
