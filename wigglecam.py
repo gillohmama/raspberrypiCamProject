@@ -386,6 +386,11 @@ def main():
                              "(wigglecam.log always has it)")
     args = parser.parse_args()
 
+    # FIRST, before pygame touches the console: SDL's framebuffer driver
+    # grabs the VT during display init, and whoever else owns that console
+    # hangs us up mid-startup. We have no terminal worth dying for.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
     setup_logging(args.verbose)
     LOG.info("starting — %d cameras, %s preview, %s view, rotated %d°",
              args.num_cams, args.preview_mode, args.view, args.rotate)
@@ -399,9 +404,6 @@ def main():
         # Ctrl-C exits cleanly (workers, pygame and all) within a second or two.
         signal.signal(signal.SIGINT, lambda *_: setattr(app, "running", False))
         signal.signal(signal.SIGTERM, lambda *_: setattr(app, "running", False))
-        # A hung-up terminal must never kill an appliance that owns the
-        # screen — we have no console worth caring about either way.
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         fatal = app.run()
     except KeyboardInterrupt:
         LOG.info("KeyboardInterrupt")

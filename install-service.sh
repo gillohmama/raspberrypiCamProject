@@ -61,5 +61,8 @@ echo "installed — waiting a few seconds, then reporting status"
 sleep 5
 systemctl status wigglecam --no-pager -l || true
 echo
+echo "---- recent log ----"
+journalctl -u wigglecam -n 25 --no-pager || true
+echo
 echo "Live output:      journalctl -u wigglecam -f"
 echo "Stop for testing: sudo systemctl stop wigglecam"

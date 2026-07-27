@@ -69,8 +69,9 @@ class DisplayManager:
         self._gif_idx = 0
         self._gif_next_t = 0.0
         self._speed_flash_until = 0.0
-        LOG.debug("display up: %dx%d %s, %d camera tiles", SCREEN_W, SCREEN_H,
-                  "windowed" if windowed else "fullscreen", num_cams)
+        LOG.info("screen ready (%dx%d %s, driver %s)", SCREEN_W, SCREEN_H,
+                 "windowed" if windowed else "fullscreen",
+                 pygame.display.get_driver())
 
     @staticmethod
     def _layout(n):
