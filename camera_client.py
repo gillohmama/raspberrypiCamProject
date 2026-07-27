@@ -55,13 +55,15 @@ class WorkerDied(Exception):
     pass
 
 
-def chown_to_invoking_user(path):
-    """The app runs under sudo; hand output files to the invoking user."""
+def chown_like_dir(path):
+    """Give a new file the same owner as the directory holding it.
+
+    The app always runs as root (sudo or systemd), so without this every
+    photo would be root-owned and awkward to copy off the Pi.
+    """
     try:
-        uid = int(os.environ.get("SUDO_UID", -1))
-        gid = int(os.environ.get("SUDO_GID", -1))
-        if uid >= 0:
-            os.chown(path, uid, gid)
+        owner = os.stat(os.path.dirname(os.path.abspath(path)))
+        os.chown(path, owner.st_uid, owner.st_gid)
     except Exception as exc:
         LOG_SVC.debug("chown of %s failed: %s", path, exc)
 
@@ -495,7 +497,7 @@ class CameraService(threading.Thread):
                 image = Image.frombytes("RGB", (header["w"], header["h"]),
                                         payload)
                 image.save(path, "JPEG", quality=JPEG_QUALITY)
-                chown_to_invoking_user(path)
+                chown_like_dir(path)
                 saved.append(path)
                 LOG_SVC.debug("saved %s", path)
 
@@ -516,7 +518,7 @@ class CameraService(threading.Thread):
                 LOG_SVC.error("GIF build failed: %s", exc, exc_info=True)
                 self.events.put(("status", "GIF build failed: %s" % exc))
                 return
-            chown_to_invoking_user(gif_path)
+            chown_like_dir(gif_path)
             LOG_SVC.info("wigglegram saved: %s (%d photos)",
                          os.path.basename(gif_path), len(saved))
             self.events.put(("gif_ready", gif_path))

@@ -124,6 +124,27 @@ Three worker deaths while in fast mode auto-demote the session to safe.
 - picamera2 pixel formats use libcamera's inverted names: `BGR888` is
   R,G,B in memory (what PIL/pygame want); `RGB888` is B,G,R.
 
+## Start automatically at boot
+
+```
+sudo cp wigglecam.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wigglecam
+```
+
+The unit runs as root from `/home/nsgill/raspberrypiCamProject` (edit the
+paths if your user differs) and owns `/dev/tty1` so SDL can reach the
+framebuffer. `Restart=always` means it comes back from crashes *and* from
+ESC — stop it with `sudo systemctl stop wigglecam` before running a manual
+copy, or the two fight over the camera.
+
+```
+systemctl status wigglecam           # is it running?
+journalctl -u wigglecam -f           # live console output
+sudo systemctl stop wigglecam        # before a manual run
+sudo systemctl disable wigglecam     # stop auto-starting
+```
+
 ## Files
 
 | file               | role                                                |
@@ -135,6 +156,7 @@ Three worker deaths while in fast mode auto-demote the session to safe.
 | `pisugar.py`       | button input (socket or I2C poll)                   |
 | `gif_builder.py`   | bounce-order GIF assembly                           |
 | `setup.sh`         | fresh-install script for Bullseye                   |
+| `wigglecam.service`| systemd unit for starting at boot                   |
 
 ## Logs
 

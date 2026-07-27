@@ -38,26 +38,35 @@ HOLD_TO_GALLERY_S = 1.0      # hold the shutter button this long -> gallery
 SWIPE_PX = 60                # horizontal travel that counts as a swipe
 
 
-def resolve_pics_dir():
-    """~/piCameraPics for the *invoking* user (the app runs under sudo)."""
-    user = os.environ.get("SUDO_USER")
-    home = None
-    if user:
-        try:
-            home = pwd.getpwnam(user).pw_dir
-        except KeyError:
-            pass
-    if not home:
-        home = os.path.expanduser("~")
-    pics = os.path.join(home, "piCameraPics")
+def resolve_pics_dir(explicit=None):
+    """Where photos go.
+
+    Under sudo that's the invoking user's ~/piCameraPics. Under systemd
+    there is no invoking user, so pass --pics-dir (see wigglecam.service).
+    """
+    if explicit:
+        pics = os.path.abspath(os.path.expanduser(explicit))
+    else:
+        user = os.environ.get("SUDO_USER")
+        home = None
+        if user:
+            try:
+                home = pwd.getpwnam(user).pw_dir
+            except KeyError:
+                pass
+        if not home:
+            home = os.path.expanduser("~")
+        pics = os.path.join(home, "piCameraPics")
+    existed = os.path.isdir(pics)
     os.makedirs(pics, exist_ok=True)
-    try:
-        uid = int(os.environ.get("SUDO_UID", -1))
-        gid = int(os.environ.get("SUDO_GID", -1))
-        if uid >= 0:
-            os.chown(pics, uid, gid)
-    except Exception:
-        pass
+    if not existed:
+        # A freshly created directory would be root-owned; match its parent
+        # so the photos stay reachable without sudo.
+        try:
+            parent = os.stat(os.path.dirname(pics))
+            os.chown(pics, parent.st_uid, parent.st_gid)
+        except Exception as exc:
+            LOG.debug("cannot chown %s: %s", pics, exc)
     return pics
 
 
@@ -126,7 +135,7 @@ class App:
 
     def __init__(self, args):
         self.events = queue.Queue()
-        self.pics_dir = resolve_pics_dir()
+        self.pics_dir = resolve_pics_dir(args.pics_dir)
         self.view = args.view
         self.display = ui.DisplayManager(args.num_cams, windowed=args.windowed)
         self.service = CameraService(args.num_cams, args.preview_mode,
@@ -360,6 +369,10 @@ def main():
                         default="fast",
                         help="fast keeps the stream running across mux "
                              "switches; safe reconfigures per frame")
+    parser.add_argument("--pics-dir", default=None,
+                        help="where to save photos and GIFs "
+                             "(default: ~/piCameraPics of the sudo user; "
+                             "required when started by systemd)")
     parser.add_argument("--rotate", type=int, choices=(0, 180), default=180,
                         help="camera image rotation; 180 (the default) suits "
                              "the upside-down mounting in the case")

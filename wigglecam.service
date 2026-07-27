@@ -1,0 +1,30 @@
+[Unit]
+# Start the wigglegram camera automatically at boot.
+# Install:  sudo cp wigglecam.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now wigglecam
+# Paths below assume the user "nsgill" — edit if yours differs.
+Description=Wigglegram camera
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/nsgill/raspberrypiCamProject
+# systemd has no SUDO_USER, so the photo directory must be explicit or
+# everything would land in /root/piCameraPics.
+ExecStart=/usr/bin/python3 /home/nsgill/raspberrypiCamProject/wigglecam.py \
+          --pics-dir /home/nsgill/piCameraPics
+
+# Own a virtual terminal: pygame/SDL1 draws to the framebuffer and wants a
+# console for keyboard handling.
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+
+# Appliance behaviour: come back from crashes, and from ESC.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
