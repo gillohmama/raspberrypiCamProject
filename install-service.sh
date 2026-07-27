@@ -42,12 +42,9 @@ WorkingDirectory=$REPO
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 $REPO/wigglecam.py --pics-dir $PICS
 
-# Own a virtual terminal: pygame/SDL1 draws straight to the framebuffer
-# and wants a console for keyboard handling.
-StandardInput=tty
-TTYPath=/dev/tty1
-TTYReset=yes
-TTYVHangup=yes
+# Deliberately NO TTYPath/StandardInput=tty: claiming /dev/tty1 fights
+# getty for the console and the resulting hangup kills us on sight. SDL
+# opens the framebuffer by itself, exactly as it does over SSH.
 
 # Appliance behaviour: come back from crashes, and from ESC.
 Restart=always

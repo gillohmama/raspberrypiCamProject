@@ -344,9 +344,10 @@ def main():
     parser.add_argument("--rotate", type=int, choices=(0, 180), default=0)
     args = parser.parse_args()
 
-    # Ctrl-C on the terminal signals the whole process group; shutdown is the
-    # parent's job (it closes our stdin, or kills us).
+    # Ctrl-C and terminal hangups signal the whole process group; shutdown is
+    # the parent's job (it closes our stdin, or kills us).
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                         format="%(name)s %(levelname)s %(message)s")

@@ -132,10 +132,15 @@ sudo ./install-service.sh
 
 It writes `/etc/systemd/system/wigglecam.service` using the repo's real
 location and your username, enables it, starts it, and prints the status.
-The unit runs as root and owns `/dev/tty1` so SDL can reach the
-framebuffer. `Restart=always` means it comes back from crashes *and* from
-ESC — stop it with `sudo systemctl stop wigglecam` before running a manual
-copy, or the two fight over the camera.
+`Restart=always` means it comes back from crashes *and* from ESC — stop it
+with `sudo systemctl stop wigglecam` before running a manual copy, or the
+two fight over the camera.
+
+The unit deliberately does **not** take a TTY. Claiming `/dev/tty1` puts
+the service in a fight with `getty@tty1`, whose virtual hangup kills it
+within milliseconds (`code=killed, signal=HUP`, restarting forever). SDL
+reaches the framebuffer on its own without a console, which is also why
+launching over SSH works.
 
 If the journal shows the app reaching `ready — photos will be saved to …`
 but the screen stays black, it is a display problem rather than a crash:

@@ -399,6 +399,9 @@ def main():
         # Ctrl-C exits cleanly (workers, pygame and all) within a second or two.
         signal.signal(signal.SIGINT, lambda *_: setattr(app, "running", False))
         signal.signal(signal.SIGTERM, lambda *_: setattr(app, "running", False))
+        # A hung-up terminal must never kill an appliance that owns the
+        # screen — we have no console worth caring about either way.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         fatal = app.run()
     except KeyboardInterrupt:
         LOG.info("KeyboardInterrupt")
