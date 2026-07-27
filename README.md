@@ -127,16 +127,21 @@ Three worker deaths while in fast mode auto-demote the session to safe.
 ## Start automatically at boot
 
 ```
-sudo cp wigglecam.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now wigglecam
+sudo ./install-service.sh
 ```
 
-The unit runs as root from `/home/nsgill/raspberrypiCamProject` (edit the
-paths if your user differs) and owns `/dev/tty1` so SDL can reach the
+It writes `/etc/systemd/system/wigglecam.service` using the repo's real
+location and your username, enables it, starts it, and prints the status.
+The unit runs as root and owns `/dev/tty1` so SDL can reach the
 framebuffer. `Restart=always` means it comes back from crashes *and* from
 ESC — stop it with `sudo systemctl stop wigglecam` before running a manual
 copy, or the two fight over the camera.
+
+If the journal shows the app reaching `ready — photos will be saved to …`
+but the screen stays black, it is a display problem rather than a crash:
+add `Environment=SDL_VIDEODRIVER=fbcon` and `Environment=SDL_FBDEV=/dev/fb0`
+to the unit, or `Environment=DISPLAY=:0` instead if the Pi boots to the
+desktop.
 
 ```
 systemctl status wigglecam           # is it running?

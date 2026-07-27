@@ -1,8 +1,6 @@
 [Unit]
-# Start the wigglegram camera automatically at boot.
-# Install:  sudo cp wigglecam.service /etc/systemd/system/
-#           sudo systemctl daemon-reload && sudo systemctl enable --now wigglecam
-# Paths below assume the user "nsgill" — edit if yours differs.
+# Reference copy — prefer `sudo ./install-service.sh`, which fills in the
+# real paths and username for you instead of assuming "nsgill".
 Description=Wigglegram camera
 After=multi-user.target
 
@@ -10,10 +8,12 @@ After=multi-user.target
 Type=simple
 User=root
 WorkingDirectory=/home/nsgill/raspberrypiCamProject
+# Without this Python block-buffers stdout into the journal and the log
+# looks empty for minutes at a time.
+Environment=PYTHONUNBUFFERED=1
 # systemd has no SUDO_USER, so the photo directory must be explicit or
 # everything would land in /root/piCameraPics.
-ExecStart=/usr/bin/python3 /home/nsgill/raspberrypiCamProject/wigglecam.py \
-          --pics-dir /home/nsgill/piCameraPics
+ExecStart=/usr/bin/python3 /home/nsgill/raspberrypiCamProject/wigglecam.py --pics-dir /home/nsgill/piCameraPics
 
 # Own a virtual terminal: pygame/SDL1 draws to the framebuffer and wants a
 # console for keyboard handling.
