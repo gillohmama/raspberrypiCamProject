@@ -36,11 +36,11 @@ QUIT_TIMEOUT_S = 2.0
 RESPAWN_DELAY_S = 1.0            # let the kernel release /dev/video* first
 
 DEAD_RETRY_INTERVAL_S = 30.0
-THUMB_REFRESH_S = 10.0           # live view: background-camera refresh cadence
 TIMEOUTS_TO_DEAD = 2             # consecutive worker-killing failures
 SOFT_FAILS_TO_DEAD = 3           # consecutive in-worker errors
 FAST_STRIKES_TO_DEMOTE = 3       # worker deaths in fast mode ...
 FAST_STRIKE_WINDOW_S = 600.0     # ... within this window -> safe mode
+BURST_STRIKES_TO_DISABLE = 2     # worker deaths mid-burst -> stop streaming
 SPAWN_FAILS_TO_FATAL = 3
 SERVICE_ERRORS_TO_FATAL = 5
 
@@ -220,13 +220,11 @@ class CameraService(threading.Thread):
         self.events = events              # shared queue.Queue to the UI
         self.link = WorkerLink(preview_mode, rotate)
         self.capturing = False
-        # "live": stream one camera continuously (no mux switches between
-        # frames -> near-real-time), refresh the rest every THUMB_REFRESH_S.
+        # "live": stream one camera and nothing else, so the mux never moves
+        # between frames and the viewfinder is genuinely real-time.
         # "grid": round-robin everything (a mux switch per frame, ~1 Hz/cam).
         self.view = view
         self.live_cam = 0
-        self._last_thumb_refresh = 0.0
-        self._thumb_rr = 0
         self.health = {c: {"state": "alive", "timeouts": 0, "soft": 0,
                            "last_retry": 0.0} for c in range(num_cams)}
         self._frames = {}                 # cam -> (seq, w, h, rgb_bytes)
@@ -238,6 +236,9 @@ class CameraService(threading.Thread):
         self._spawn_fails = 0
         self._fast_strikes = []
         self._service_errors = 0
+        self._burst_stream_ok = True   # may the burst hold the stream open?
+        self._burst_streaming = False  # is it holding it open right now?
+        self._burst_strikes = 0
 
     # ------------------------------------------------------------ UI-facing
 
@@ -277,6 +278,19 @@ class CameraService(threading.Thread):
         self.live_cam = cam
         LOG_SVC.debug("live camera -> %d", cam + 1)
         self.events.put(("status", "Live view: camera %d" % (cam + 1)))
+
+    def next_live_cam(self):
+        """Advance to the next healthy camera — the touch equivalent of 1-4,
+        and the replacement for tapping a thumbnail."""
+        alive = [c for c in range(self.num_cams)
+                 if self.health[c]["state"] == "alive"]
+        if len(alive) < 2:
+            self.events.put(("status", "No other camera is online"))
+            return
+        if self.live_cam in alive:
+            self.set_live_cam(alive[(alive.index(self.live_cam) + 1) % len(alive)])
+        else:
+            self.set_live_cam(alive[0])
 
     def stop(self):
         self._running = False
@@ -335,20 +349,17 @@ class CameraService(threading.Thread):
                 if self.health[self._rr]["state"] == "alive":
                     return self._rr
             return None
-        # Live view: stream the live camera; steal a slot for one background
-        # camera every THUMB_REFRESH_S (that costs two mux switches, hence
-        # the deliberately long cadence).
+        # Live view: only ever the live camera. Sampling the others in the
+        # background cost two mux switches and a visible stall each time, to
+        # keep thumbnails of cameras that cannot be on simultaneously anyway.
+        # Their health is now learned at capture time (and from the offline
+        # retry above), not by polling.
         if self.live_cam not in alive:
             self.live_cam = alive[0]
             LOG_SVC.info("live view switched to camera %d (previous one went offline)",
                          self.live_cam + 1)
             self.events.put(("status",
                              "Live view: camera %d" % (self.live_cam + 1)))
-        others = [c for c in alive if c != self.live_cam]
-        if others and now - self._last_thumb_refresh >= THUMB_REFRESH_S:
-            self._last_thumb_refresh = now
-            self._thumb_rr = (self._thumb_rr + 1) % len(others)
-            return others[self._thumb_rr]
         return self.live_cam
 
     def _preview_tick(self):
@@ -461,9 +472,88 @@ class CameraService(threading.Thread):
         if self._ensure_worker():
             self.events.put(("status", "Preview mode: %s" % new_mode.upper()))
 
+    def _begin_burst(self, first_cam):
+        """Ask the worker to lock exposure/white balance for this capture.
+
+        Everything the burst does is in camera_worker.burst_begin; here we
+        only need to know whether it kept the stream open, because that is
+        the part that can upset libcamera and so the part worth retrying
+        around. A failure is not fatal — without a burst the worker falls
+        back to the old per-camera sequence on its own.
+        """
+        self._burst_streaming = False
+        try:
+            header, _ = self.link.request(
+                {"cmd": "burst_begin", "cam": first_cam,
+                 "stream": self._burst_stream_ok}, STILL_TIMEOUT_S)
+        except (WorkerTimeout, WorkerDied) as exc:
+            # The worker died inside the ordinary stop/configure/start path,
+            # so this is camera trouble rather than burst trouble: no strike.
+            self._worker_incident(first_cam, exc)
+            return
+        if not header.get("ok"):
+            LOG_SVC.warning("could not lock exposure for this capture (%s) — "
+                            "frames may vary in brightness",
+                            header.get("error", "?"))
+            return
+        self._burst_streaming = bool(header.get("streaming"))
+
+    def _end_burst(self):
+        self._burst_streaming = False
+        try:
+            self.link.request({"cmd": "burst_end"}, STILL_TIMEOUT_S)
+        except (WorkerTimeout, WorkerDied) as exc:
+            LOG_SVC.warning("camera engine did not close the burst cleanly (%s)",
+                            exc)
+            self._recover_worker()
+
+    def _burst_strike(self):
+        self._burst_strikes += 1
+        LOG_SVC.debug("burst strike %d/%d",
+                      self._burst_strikes, BURST_STRIKES_TO_DISABLE)
+        if self._burst_strikes >= BURST_STRIKES_TO_DISABLE and self._burst_stream_ok:
+            self._burst_stream_ok = False
+            LOG_SVC.warning("streaming bursts keep killing the camera engine — "
+                            "captures will use the slower per-camera sequence "
+                            "from now on (exposure stays locked)")
+            self.events.put(("status", "Slower capture mode — burst disabled"))
+
+    def _grab_still(self, cam):
+        """One still, returning (w, h, rgb_bytes) or None.
+
+        A streaming burst switches the mux underneath a live stream; if that
+        wedges libcamera the worker dies and respawns without the burst, so
+        one retry runs the proven stop/start sequence rather than blaming a
+        camera that is probably fine.
+        """
+        for attempt in (1, 2):
+            streaming = self._burst_streaming
+            try:
+                header, payload = self.link.request(
+                    {"cmd": "still", "cam": cam}, STILL_TIMEOUT_S)
+            except (WorkerTimeout, WorkerDied) as exc:
+                self._burst_streaming = False
+                if streaming:
+                    self._burst_strike()
+                self._worker_incident(cam, exc)
+                if streaming and attempt == 1:
+                    LOG_SVC.info("retrying camera %d without the burst", cam + 1)
+                    continue
+                return None
+            if not header.get("ok"):
+                self._soft_fail(cam, header.get("error", "?"))
+                return None
+            if len(payload) != header["w"] * header["h"] * 3:
+                self._soft_fail(cam, "short still (%d bytes)" % len(payload))
+                return None
+            self._mark_alive(cam)
+            return header["w"], header["h"], payload
+        return None
+
     def _do_capture(self):
         self.capturing = True
         try:
+            started = time.monotonic()
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             targets = [c for c in range(self.num_cams)
                        if self.health[c]["state"] == "alive"]
@@ -476,30 +566,26 @@ class CameraService(threading.Thread):
                 return
 
             saved = []
-            for i, cam in enumerate(targets):
-                self.events.put(("progress", "Capturing %d/%d (cam %d)…"
-                                 % (i + 1, len(targets), cam + 1)))
-                try:
-                    header, payload = self.link.request(
-                        {"cmd": "still", "cam": cam}, STILL_TIMEOUT_S)
-                except (WorkerTimeout, WorkerDied) as exc:
-                    self._worker_incident(cam, exc)
-                    continue
-                if not header.get("ok"):
-                    self._soft_fail(cam, header.get("error", "?"))
-                    continue
-                if len(payload) != header["w"] * header["h"] * 3:
-                    self._soft_fail(cam, "short still (%d bytes)" % len(payload))
-                    continue
-                self._mark_alive(cam)
-                path = os.path.join(self.pics_dir,
-                                    "%s_cam%d.jpg" % (timestamp, cam + 1))
-                image = Image.frombytes("RGB", (header["w"], header["h"]),
-                                        payload)
-                image.save(path, "JPEG", quality=JPEG_QUALITY)
-                chown_like_dir(path)
-                saved.append(path)
-                LOG_SVC.debug("saved %s", path)
+            self._begin_burst(targets[0])
+            try:
+                for i, cam in enumerate(targets):
+                    self.events.put(("progress", "Capturing %d/%d (cam %d)…"
+                                     % (i + 1, len(targets), cam + 1)))
+                    frame = self._grab_still(cam)
+                    if frame is None:
+                        continue
+                    width, height, payload = frame
+                    path = os.path.join(self.pics_dir,
+                                        "%s_cam%d.jpg" % (timestamp, cam + 1))
+                    image = Image.frombytes("RGB", (width, height), payload)
+                    image.save(path, "JPEG", quality=JPEG_QUALITY)
+                    chown_like_dir(path)
+                    saved.append(path)
+                    LOG_SVC.debug("saved %s", path)
+            finally:
+                self._end_burst()
+            LOG_SVC.info("burst took %.1fs for %d frame(s)",
+                         time.monotonic() - started, len(saved))
 
             if len(saved) < 2:
                 LOG_SVC.warning("capture failed — only %d good photo(s)",

@@ -159,7 +159,8 @@ class App:
         self.service.start()
         self.buttons.start()
         LOG.info("ready — photos will be saved to %s", self.pics_dir)
-        self.display.set_status("Ready — tap the button or SPACE to shoot", 5)
+        self.display.set_status(
+            "Ready — tap the button to shoot, the image to switch camera", 5)
         clock = pygame.time.Clock()
         while self.running:
             for event in pygame.event.get():
@@ -212,10 +213,6 @@ class App:
         if self.display.hit_shutter(pos):
             self._btn_held = True
             self._hold_done = False
-        elif self.mode == self.MODE_LIVE and self.view == "live":
-            cam = self.display.hit_thumbnail(pos)
-            if cam is not None:
-                self.service.set_live_cam(cam)
 
     def _on_touch_up(self, pos):
         was_held, self._btn_held = self._btn_held, False
@@ -229,7 +226,13 @@ class App:
             else:
                 self.service.request_capture()
             return
-        if self.mode != self.MODE_GALLERY or down_pos is None:
+        if self.mode == self.MODE_LIVE:
+            # With the corner thumbnails gone, tapping the viewfinder is how
+            # you change camera by touch (1-4 still work on a keyboard).
+            if self.view == "live":
+                self.service.next_live_cam()
+            return
+        if down_pos is None:
             return
         dx = pos[0] - down_pos[0]
         if abs(dx) >= SWIPE_PX:
@@ -377,8 +380,9 @@ def main():
                         help="camera image rotation; 180 (the default) suits "
                              "the upside-down mounting in the case")
     parser.add_argument("--view", choices=("live", "grid"), default="live",
-                        help="live streams one camera near-real-time with "
-                             "thumbnails; grid round-robins all cameras")
+                        help="live streams one camera near-real-time and "
+                             "touches nothing else; grid round-robins all "
+                             "cameras (useful for checking every port)")
     parser.add_argument("--windowed", action="store_true",
                         help="don't go fullscreen (development)")
     parser.add_argument("--verbose", action="store_true",

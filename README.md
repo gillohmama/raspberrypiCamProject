@@ -21,8 +21,8 @@ turns it off if they are ever remounted.
 
 ## Controls
 
-A round shutter button sits in the top-left corner of the screen; the other
-cameras' thumbnails occupy the remaining corners. Holding the button fills a
+A round shutter button sits in the top-left corner of the screen; the rest
+of it is the viewfinder. Holding the button fills a
 clock-style ring — when the circle completes, the gallery opens with every
 wigglegram on the device (newest first), each playing its loop. The same
 button (now a back arrow) returns to the camera.
@@ -34,7 +34,7 @@ button (now a back arrow) returns to the camera.
 | (gallery) older / newer | —              | → / ←    | swipe left / right |
 | (gallery) slower/faster | —              | - / +    | tap left / right half |
 | (gallery) back to camera| single tap     | G        | tap the button |
-| Switch live camera      | —              | 1–4      | tap a thumbnail |
+| Switch live camera      | —              | 1–4      | tap the image |
 | Toggle live/grid view   | —              | V        | —     |
 | Toggle preview fast/safe| —              | F        | —     |
 | Quit                    | —              | ESC      | —     |
@@ -88,14 +88,22 @@ frames). A flaky ribbon on one port never blocks the others.
 Every tile refresh costs a mux switch (~0.2 s verified settle + frame
 flushes), so refreshing *all* tiles fast is physically impossible. Instead:
 
-- **live** (default): ONE camera streams continuously — no mux switching
-  between frames at all, so it runs at ~15–25 fps, like a real camera.
-  The other cameras appear as corner thumbnails refreshed round-robin every
-  ~10 s (each refresh is two mux switches, hence a brief hitch — rare by
-  design). Tap a thumbnail or press 1–4 to change the live camera; if the
-  live camera dies, the view hops to the next healthy one.
+- **live** (default): ONE camera streams, full screen, and the mux is not
+  touched at all between frames — ~15–25 fps, like a real camera. Tap the
+  image or press 1–4 to move to the next healthy camera; if the live one
+  dies, the view hops on its own.
 - **grid** (V key / `--view grid`): all cameras round-robin, each tile
   refreshing every ~1 s in fast mode. Useful for checking all ports at once.
+
+Live view used to keep corner thumbnails of the other cameras, refreshed
+round-robin every ~10 s. Each refresh was two mux switches and a visible
+stall in the viewfinder, spent on a picture of a camera that physically
+cannot be running at the same time as the live one — so they are gone. The
+consequence is that a camera which quietly dies is no longer noticed within
+30 s: it is discovered during the next capture, which costs one timeout and
+worker respawn before that camera is marked offline and skipped. Once
+offline it is retried in the background every 30 s as before. Use grid view
+if you want to check every port on purpose.
 
 ### Preview strategies
 
@@ -107,6 +115,30 @@ flushes), so refreshing *all* tiles fast is physically impossible. Instead:
 
 Three worker deaths while in fast mode auto-demote the session to safe.
 `--preview-mode safe` or the F key force it.
+
+### Capture bursts
+
+The mux means the cameras are shot one after another, so a capture is
+bracketed by `burst_begin` / `burst_end`:
+
+- **Exposure and white balance are locked** to whatever the first camera's
+  AE settled on, and forced on the rest. Without this each sensor meters
+  for itself and the finished loop flickers in brightness and colour —
+  the most visible artefact in a wigglegram, and not something the GIF
+  encoder can fix afterwards. All four are IMX219 in the same sensor mode,
+  so the values transfer exactly.
+- **The AE settle disappears** for every camera after the first (0.4 s
+  each), because there is no longer any AE to converge.
+- In fast mode the burst also **keeps the stream running** and switches the
+  mux underneath it, as fast previews do, instead of reconfiguring per
+  camera. In safe mode it doesn't — safe mode already means live mux
+  switching is unreliable on this rig — but the exposure lock still applies.
+
+If a streaming burst kills the worker, the camera is retried once on the
+respawned worker (which comes back without a burst, i.e. on the proven
+sequence) before being blamed, and two such deaths disable streaming
+bursts for the session. Each capture logs `burst took N.Ns` — compare that
+number between modes rather than guessing.
 
 ### Hardware invariants (verified in the field — do not "simplify")
 

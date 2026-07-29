@@ -23,9 +23,6 @@ MAX_FRAME_MS = 1000
 DEFAULT_FRAME_MS = 150
 SPEED_STEP = 1.25
 
-THUMB_W, THUMB_H = 144, 81      # 16:9 like the preview frames
-THUMB_MARGIN = 8
-
 # On-screen shutter button, top-left corner. Tap = shoot; hold = the pie
 # fills like a clock and the gallery opens; in the gallery it's the back
 # button.
@@ -56,10 +53,8 @@ class DisplayManager:
         self.num_cams = num_cams
         self.font = pygame.font.Font(None, 24)
         self.font_big = pygame.font.Font(None, 44)
-        self.font_small = pygame.font.Font(None, 18)
         self.tiles, self.info_rect = self._layout(num_cams)
         self._tile_cache = {}          # cam -> (seq, scaled surface)
-        self._thumb_hits = []          # [(rect, cam)] from the last live draw
         self.status_msg = ""
         self.status_until = 0.0
         self.progress_msg = None       # sticky banner while capturing
@@ -138,53 +133,18 @@ class DisplayManager:
         pygame.display.flip()
 
     def _draw_live(self, frames, health, live_cam):
+        """One camera, full screen, nothing else.
+
+        There used to be thumbnails of the other cameras in the free
+        corners; keeping them current meant switching the mux away from the
+        live camera and back every few seconds, which stalled the
+        viewfinder for a picture of a camera that cannot be running at the
+        same time anyway. The status bar still shows every camera's health.
+        """
         area = pygame.Rect(0, 0, SCREEN_W, SCREEN_H - STATUS_H)
         self._draw_tile(live_cam, area, frames.get(live_cam),
                         health.get(live_cam, "alive"), live=True,
                         label_pos=(SHUTTER_CENTER[0] + SHUTTER_R + 10, 10))
-        # The other cameras take the free corners (top-left is the button's).
-        corners = [
-            (SCREEN_W - THUMB_MARGIN - THUMB_W, THUMB_MARGIN),
-            (SCREEN_W - THUMB_MARGIN - THUMB_W,
-             area.bottom - THUMB_MARGIN - THUMB_H),
-            (THUMB_MARGIN, area.bottom - THUMB_MARGIN - THUMB_H),
-        ]
-        others = [c for c in range(self.num_cams) if c != live_cam]
-        self._thumb_hits = []
-        for corner, cam in zip(corners, others):
-            rect = pygame.Rect(corner, (THUMB_W, THUMB_H))
-            self._draw_thumb(cam, rect, frames.get(cam),
-                             health.get(cam, "alive"))
-            self._thumb_hits.append((rect, cam))
-
-    def _draw_thumb(self, cam, rect, frame, state):
-        alive = state == "alive"
-        if not alive:
-            pygame.draw.rect(self.screen, TILE_DEAD_BG, rect)
-        elif frame is None:
-            pygame.draw.rect(self.screen, TILE_BG, rect)
-        else:
-            seq, w, h, data = frame
-            cached = self._tile_cache.get(cam)
-            if (cached is None or cached[0] != seq
-                    or cached[1].get_size() != rect.size):
-                surf = pygame.image.frombuffer(data, (w, h), "RGB")
-                surf = pygame.transform.smoothscale(surf, rect.size)
-                self._tile_cache[cam] = (seq, surf)
-            self.screen.blit(self._tile_cache[cam][1], rect)
-        pygame.draw.rect(self.screen,
-                         (200, 200, 200) if alive else TEXT_BAD, rect, 1)
-        label = "%d (%s)%s" % (cam + 1, PORT_LETTERS[cam],
-                               "" if alive else " OFF")
-        self._text(label, TEXT if alive else TEXT_BAD, font=self.font_small,
-                   topleft=(rect.x + 4, rect.y + 3))
-
-    def hit_thumbnail(self, pos):
-        """Camera index of the thumbnail under a tap, or None."""
-        for rect, cam in self._thumb_hits:
-            if rect.collidepoint(pos):
-                return cam
-        return None
 
     def hit_shutter(self, pos):
         """True if a tap landed on the shutter/back button (finger-sized slop)."""
@@ -259,7 +219,7 @@ class DisplayManager:
             ("button / SPACE   shoot", TEXT_DIM),
             ("hold button / G  gallery", TEXT_DIM),
             ("V                live/grid view", TEXT_DIM),
-            ("1-4              live camera", TEXT_DIM),
+            ("1-4 / tap image  live camera", TEXT_DIM),
             ("F                preview mode", TEXT_DIM),
             ("ESC              quit", TEXT_DIM),
         ]

@@ -14,8 +14,13 @@ death is the recovery mechanism.
 
 Protocol (parent speaks first, strict request/response):
   stdin   one JSON object per line, e.g. {"cmd": "preview", "cam": 0}
+          commands: ping, preview, still, burst_begin, burst_end, quit
   stdout  one JSON header line, then exactly header["len"] raw RGB bytes
   stderr  log lines (relayed into the parent's log)
+
+A capture is bracketed by burst_begin/burst_end so the stills in it share
+one exposure; see CameraEngine.burst_begin. Both are safe to send at any
+time — a worker that respawned mid-burst simply comes back without one.
 """
 
 import argparse
@@ -78,6 +83,10 @@ STILL_SIZE = (1920, 1080)
 AE_SETTLE_PREVIEW_S = 0.30   # exposure convergence before a preview grab
 AE_SETTLE_STILL_S = 0.40     # a bit longer before a keeper
 FAST_FLUSH_FRAMES = 2        # frames in flight during a live mux switch
+
+# Read off the first camera of a burst and forced on the rest, so the four
+# frames of a wigglegram match instead of each metering for itself.
+BURST_LOCK_KEYS = ("ExposureTime", "AnalogueGain", "ColourGains")
 
 BUS_CLEAR_COOLDOWN_S = 10.0
 _last_bus_clear = 0.0
@@ -207,6 +216,12 @@ class CameraEngine:
             Deliberate experiment: all ports carry identical IMX219 timing,
             so the CSI frontend should keep locking. If it upsets libcamera
             the parent kills us and (after enough strikes) respawns in safe.
+
+    Capture bursts (burst_begin / still... / burst_end) exist because the
+    cameras are shot one after another: exposure and white balance are
+    frozen at the first camera's values so the frames match, and — in fast
+    mode — the stream is left running so the rest cost a mux switch rather
+    than a full reconfigure.
     """
 
     def __init__(self, preview_mode, rotate=0):
@@ -226,6 +241,8 @@ class CameraEngine:
         # automatically if buffer allocation can't afford it.
         self._pin_raw = True
         self._cfg_cache = {}
+        self._locked = None      # AE/AWB controls held for the current burst
+        self._burst = False      # burst is keeping the stream running
         LOG.info("camera engine ready (preview_mode=%s, rotate=%d%s)",
                  preview_mode, rotate,
                  ", in software" if self._sw_rotate else "")
@@ -274,10 +291,22 @@ class CameraEngine:
         # re-serialises it in C order, so the view is safe to return.
         return arr[::-1, ::-1] if self._sw_rotate else arr
 
+    def _apply_locked(self):
+        """Re-assert the burst's exposure lock. Necessary after every
+        configure(): picamera2 rebuilds its control set from the camera
+        configuration, dropping anything set earlier."""
+        if self._locked:
+            self.picam2.set_controls(self._locked)
+
     def _stop_if_running(self):
         if self._running_kind is not None:
             self.picam2.stop()
             self._running_kind = None
+
+    @property
+    def streaming(self):
+        """True while a burst is holding the stream open across mux switches."""
+        return self._burst
 
     def preview(self, cam):
         if self.preview_mode == "fast":
@@ -309,8 +338,25 @@ class CameraEngine:
                 self.picam2.capture_array("main")
         return self._oriented(self.picam2.capture_array("main"))
 
-    def still(self, cam):
-        # Stills always use the safe sequence — reliability over speed here.
+    def burst_begin(self, cam, stream=True):
+        """Open a capture sequence: converge exposure and white balance on
+        `cam`, then hold those values for every camera in the burst.
+
+        The sensors otherwise meter independently, so the finished loop
+        flickers in brightness and colour from frame to frame — the most
+        visible artefact in a wigglegram, and one no amount of GIF
+        post-processing fixes properly. Freezing also removes the AE settle
+        from every camera after the first, which is most of the dead time
+        between shots.
+
+        With `stream`, and only in fast preview mode, the stream is left
+        running so the remaining stills cost a mux switch instead of a
+        reconfigure. Safe mode means live mux switching has already proved
+        unreliable on this rig, so there the burst takes the exposure lock
+        and nothing else.
+        """
+        self._burst = False
+        self._locked = None
         self._stop_if_running()
         self.mux.select(cam)
         self._configure("still")
@@ -318,6 +364,59 @@ class CameraEngine:
         self._running_kind = "still"
         time.sleep(AE_SETTLE_STILL_S)
         self.picam2.capture_array("main")   # discard: AE/AWB still converging
+        metadata = self.picam2.capture_metadata()
+
+        locked = {"AeEnable": False, "AwbEnable": False}
+        for key in BURST_LOCK_KEYS:
+            if metadata.get(key) is not None:
+                locked[key] = metadata[key]
+        self.picam2.set_controls(locked)
+        self._locked = locked
+        self._burst = bool(stream) and self.preview_mode == "fast"
+        LOG.info("burst locked on cam %d (%s), streaming=%s", cam,
+                 ", ".join("%s=%s" % (k, locked[k])
+                           for k in BURST_LOCK_KEYS if k in locked),
+                 self._burst)
+        if not self._burst:
+            self._stop_if_running()
+
+    def burst_end(self):
+        """Close a capture sequence and give metering back to the viewfinder."""
+        active = self._burst or self._locked is not None
+        self._burst = False
+        self._locked = None
+        self._stop_if_running()
+        if active:
+            # configure() would clear these anyway, but an AeEnable=False left
+            # behind would freeze the viewfinder at the burst's exposure.
+            self.picam2.set_controls({"AeEnable": True, "AwbEnable": True})
+            LOG.debug("burst ended, metering unlocked")
+
+    def still(self, cam):
+        if self._burst and self._running_kind == "still":
+            return self._still_streamed(cam)
+        return self._still_safe(cam)
+
+    def _still_streamed(self, cam):
+        """Grab off the burst's running stream: switch the mux, flush the
+        frames that were in flight during the switch, keep the next one."""
+        if self.mux.current != cam:
+            self.mux.select(cam)
+            for _ in range(FAST_FLUSH_FRAMES):
+                self.picam2.capture_array("main")
+        return self._oriented(self.picam2.capture_array("main"))
+
+    def _still_safe(self, cam):
+        """Full stop -> switch -> configure -> start -> grab -> stop."""
+        self._stop_if_running()
+        self.mux.select(cam)
+        self._configure("still")
+        self._apply_locked()
+        self.picam2.start()
+        self._running_kind = "still"
+        if self._locked is None:
+            time.sleep(AE_SETTLE_STILL_S)
+        self.picam2.capture_array("main")   # discard: first frame after start
         arr = self.picam2.capture_array("main")
         self._stop_if_running()
         return self._oriented(arr)
@@ -383,6 +482,25 @@ def main():
                 break
             if cmd == "ping":
                 send({"ok": True, "cmd": "ping"})
+                continue
+            if cmd == "burst_begin" and isinstance(cam, int) and 0 <= cam <= 3:
+                try:
+                    engine.burst_begin(cam, stream=bool(req.get("stream", True)))
+                except Exception as exc:
+                    LOG.warning("burst_begin on cam %d failed: %s", cam, exc)
+                    send({"ok": False, "cmd": cmd, "cam": cam, "error": str(exc)})
+                    continue
+                send({"ok": True, "cmd": cmd, "cam": cam,
+                      "streaming": engine.streaming})
+                continue
+            if cmd == "burst_end":
+                try:
+                    engine.burst_end()
+                except Exception as exc:
+                    LOG.warning("burst_end failed: %s", exc)
+                    send({"ok": False, "cmd": cmd, "error": str(exc)})
+                    continue
+                send({"ok": True, "cmd": cmd})
                 continue
             if cmd in ("preview", "still") and isinstance(cam, int) and 0 <= cam <= 3:
                 t0 = time.monotonic()
