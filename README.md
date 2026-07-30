@@ -9,10 +9,12 @@ Runs on **Raspberry Pi OS Bullseye only** (the Arducam adapter does not work
 on newer releases). Python 3.9, pygame 1.9.6, apt-installed picamera2.
 
 ```
-sudo python3 wigglecam.py              # all four ports (the default)
-sudo python3 wigglecam.py 3            # only ports A, B, C
+sudo python3 wigglecam.py              # two cameras, grid view (the default)
+sudo python3 wigglecam.py 4            # all four ports
+sudo python3 wigglecam.py --view live  # one camera, full screen
 sudo python3 wigglecam.py --preview-mode safe
 sudo python3 wigglecam.py --rotate 0   # cameras mounted the right way up
+sudo python3 wigglecam.py --mux-settle 100 --gpio-settle 50   # back off the timing
 ```
 
 The cameras sit upside down in the case, so images are rotated 180° by
@@ -85,15 +87,14 @@ frames). A flaky ribbon on one port never blocks the others.
 
 ### Viewfinder views
 
-Every tile refresh costs a mux switch (~0.2 s verified settle + frame
-flushes), so refreshing *all* tiles fast is physically impossible. Instead:
-
-- **live** (default): ONE camera streams, full screen, and the mux is not
-  touched at all between frames — ~15–25 fps, like a real camera. Tap the
-  image or press 1–4 to move to the next healthy camera; if the live one
-  dies, the view hops on its own.
-- **grid** (V key / `--view grid`): all cameras round-robin, each tile
-  refreshing every ~1 s in fast mode. Useful for checking all ports at once.
+- **grid** (default): every camera gets a full-size tile and they round-robin,
+  one mux switch per tile. With two cameras and the default timings that is
+  several frames per second each — roughly what Arducam's own demo manages,
+  and close enough to live to frame a shot with.
+- **live** (`--view live` / V key): ONE camera streams full screen and the mux
+  is never touched between frames, so it runs at whatever the pipe sustains.
+  Tap the image or press 1–4 to move to the next healthy camera; if the live
+  one dies, the view hops on its own.
 
 Live view used to keep corner thumbnails of the other cameras, refreshed
 round-robin every ~10 s. Each refresh was two mux switches and a visible
@@ -115,6 +116,13 @@ if you want to check every port on purpose.
 
 Three worker deaths while in fast mode auto-demote the session to safe.
 `--preview-mode safe` or the F key force it.
+
+The other brake on preview rate is the raw stream. Pinning it to the still
+sensor mode makes the viewfinder's field of view match the photos, but forces
+a full-resolution readout for every preview frame. That is **off by default**
+now — previews run whatever fast, usually binned, mode libcamera picks, so the
+viewfinder sees a little wider than the stills will. `--pin-raw` trades the
+frame rate back for a truthful field of view.
 
 ### Capture bursts
 
@@ -144,8 +152,16 @@ number between modes rather than guessing.
 
 - Mux switch = GPIO **and** I2C, in that order, camera stopped (safe path):
   BCM 4/17/18 = select A / select B / OE, then write `0x04+n` to reg `0x00`
-  at I2C `0x70`; OE must be driven HIGH before the first I2C contact; ~0.2 s
-  settle after switching.
+  at I2C `0x70`; OE must be driven HIGH before the first I2C contact.
+- The settle delays are **not** hardware constants. They started at 100 ms
+  (GPIO) and 200 ms (I2C) as conservative padding and were wrongly written up
+  here as verified minimums; the switch is an analog CSI mux plus one register
+  write and settles far faster. Defaults are now 5 ms and 25 ms, tunable with
+  `--gpio-settle` / `--mux-settle`. If a tile shows the *previous* camera's
+  picture, raise `--gpio-settle`; if libcamera reports frontend timeouts on
+  wiring you trust, raise `--mux-settle`. Tune these only on a rig that is
+  known good — a marginal connector produces the same frontend timeout as a
+  too-short delay, and you cannot tell them apart.
 - A wedged I2C bus (everything errno 110) survives reboots; the worker
   recovers it in software: ~10 SCL pulses, a STOP condition, then
   `raspi-gpio set 2/3 a0 pu` to restore ALT0.

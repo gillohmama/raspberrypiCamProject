@@ -140,7 +140,10 @@ class App:
         self.display = ui.DisplayManager(args.num_cams, windowed=args.windowed)
         self.service = CameraService(args.num_cams, args.preview_mode,
                                      self.pics_dir, self.events,
-                                     view=args.view, rotate=args.rotate)
+                                     view=args.view, rotate=args.rotate,
+                                     tuning={"gpio_settle_ms": args.gpio_settle,
+                                             "mux_settle_ms": args.mux_settle,
+                                             "pin_raw": args.pin_raw})
         self.buttons = PiSugarButtons(self.events)
         self.mode = self.MODE_LIVE
         self.gifs = []               # gallery contents, newest first
@@ -160,7 +163,8 @@ class App:
         self.buttons.start()
         LOG.info("ready — photos will be saved to %s", self.pics_dir)
         self.display.set_status(
-            "Ready — tap the button to shoot, the image to switch camera", 5)
+            "Ready — tap the button to shoot"
+            + ("" if self.view == "grid" else ", the image to switch camera"), 5)
         clock = pygame.time.Clock()
         while self.running:
             for event in pygame.event.get():
@@ -365,7 +369,7 @@ class App:
 
 def main():
     parser = argparse.ArgumentParser(description="Wigglegram camera")
-    parser.add_argument("num_cams", nargs="?", type=int, default=4,
+    parser.add_argument("num_cams", nargs="?", type=int, default=2,
                         choices=(2, 3, 4),
                         help="how many cameras are connected (ports A, B, …)")
     parser.add_argument("--preview-mode", choices=("fast", "safe"),
@@ -379,10 +383,21 @@ def main():
     parser.add_argument("--rotate", type=int, choices=(0, 180), default=180,
                         help="camera image rotation; 180 (the default) suits "
                              "the upside-down mounting in the case")
-    parser.add_argument("--view", choices=("live", "grid"), default="live",
-                        help="live streams one camera near-real-time and "
-                             "touches nothing else; grid round-robins all "
-                             "cameras (useful for checking every port)")
+    parser.add_argument("--view", choices=("live", "grid"), default="grid",
+                        help="grid (the default) round-robins every camera "
+                             "into a full-size tile; live streams one camera "
+                             "and touches nothing else")
+    parser.add_argument("--gpio-settle", type=float, default=None,
+                        help="ms to wait after moving the mux select GPIOs "
+                             "(worker default 5; raise it if a tile shows the "
+                             "wrong camera's picture)")
+    parser.add_argument("--mux-settle", type=float, default=None,
+                        help="ms to wait after the mux I2C write "
+                             "(worker default 25; raise it if libcamera "
+                             "reports frontend timeouts)")
+    parser.add_argument("--pin-raw", action="store_true",
+                        help="make the viewfinder field of view match the "
+                             "stills; costs a lot of preview rate")
     parser.add_argument("--windowed", action="store_true",
                         help="don't go fullscreen (development)")
     parser.add_argument("--verbose", action="store_true",

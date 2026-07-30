@@ -71,11 +71,27 @@ def chown_like_dir(path):
 class WorkerLink:
     """Owns the worker subprocess and its framed pipe protocol."""
 
-    def __init__(self, preview_mode, rotate=0):
+    def __init__(self, preview_mode, rotate=0, tuning=None):
         self.preview_mode = preview_mode
         self.rotate = rotate
+        # Timing knobs forwarded to the worker. Only keys that were actually
+        # given on the command line appear here, so the worker's own defaults
+        # stay the single source of truth.
+        self.tuning = tuning or {}
         self._proc = None
         self._buf = bytearray()
+
+    def _argv(self, worker):
+        argv = [sys.executable, "-u", worker,
+                "--preview-mode", self.preview_mode,
+                "--rotate", str(self.rotate)]
+        if self.tuning.get("gpio_settle_ms") is not None:
+            argv += ["--gpio-settle", str(self.tuning["gpio_settle_ms"])]
+        if self.tuning.get("mux_settle_ms") is not None:
+            argv += ["--mux-settle", str(self.tuning["mux_settle_ms"])]
+        if self.tuning.get("pin_raw"):
+            argv.append("--pin-raw")
+        return argv
 
     def start(self):
         worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -83,9 +99,7 @@ class WorkerLink:
         LOG_LINK.debug("spawning camera worker (preview_mode=%s)", self.preview_mode)
         self._buf = bytearray()
         self._proc = subprocess.Popen(
-            [sys.executable, "-u", worker,
-             "--preview-mode", self.preview_mode,
-             "--rotate", str(self.rotate)],
+            self._argv(worker),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, bufsize=0)
         threading.Thread(target=self._pump_stderr, args=(self._proc,),
@@ -212,13 +226,13 @@ class WorkerLink:
 class CameraService(threading.Thread):
     """Preview pump, capture sequencer and camera health tracker."""
 
-    def __init__(self, num_cams, preview_mode, pics_dir, events, view="live",
-                 rotate=0):
+    def __init__(self, num_cams, preview_mode, pics_dir, events, view="grid",
+                 rotate=0, tuning=None):
         super().__init__(daemon=True, name="camera-service")
         self.num_cams = num_cams
         self.pics_dir = pics_dir
         self.events = events              # shared queue.Queue to the UI
-        self.link = WorkerLink(preview_mode, rotate)
+        self.link = WorkerLink(preview_mode, rotate, tuning)
         self.capturing = False
         # "live": stream one camera and nothing else, so the mux never moves
         # between frames and the viewfinder is genuinely real-time.

@@ -69,8 +69,15 @@ MUX_GPIO_STATES = [
 ]
 MUX_I2C_VALUES = [0x04, 0x05, 0x06, 0x07]
 
-GPIO_SETTLE_S = 0.1    # GPIO half settled before the I2C transaction
-MUX_SETTLE_S = 0.2     # mux settle after a completed switch
+# Settle delays around a mux switch. These used to be 0.1 s and 0.2 s, which
+# was generous padding rather than a measured minimum — the switch is an
+# analog CSI mux plus one I2C register write, and Arducam's own samples
+# barely wait at all. Short values are what make the viewfinder feel live, so
+# they are the default now and tunable from the command line. Raise them if
+# previews start showing the *previous* camera's frame, or if libcamera
+# reports frontend timeouts on a rig whose wiring is known good.
+DEFAULT_GPIO_SETTLE_MS = 5.0
+DEFAULT_MUX_SETTLE_MS = 25.0
 
 # libcamera names pixel formats DRM-style: "BGR888" is R,G,B in memory,
 # which is what PIL and pygame expect. ("RGB888" would be B,G,R.)
@@ -147,8 +154,10 @@ def clear_i2c_bus():
 class MuxController:
     """The Arducam Multi Camera Adapter V2.2 select logic."""
 
-    def __init__(self):
+    def __init__(self, gpio_settle_s, mux_settle_s):
         self.current = -1
+        self.gpio_settle_s = gpio_settle_s
+        self.mux_settle_s = mux_settle_s
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(False)
         for pin in (GPIO_SEL_A, GPIO_SEL_B, GPIO_SEL_OE):
@@ -156,10 +165,11 @@ class MuxController:
         # The GPIO half (including OE high, camera A pattern) must be driven
         # before the very first I2C contact or the mux never responds.
         self._apply_gpio(0)
-        time.sleep(GPIO_SETTLE_S)
+        time.sleep(self.gpio_settle_s)
         self._bus = smbus2.SMBus(I2C_BUS)
-        LOG.info("mux ready (bus=%d addr=0x%02X, GPIO %d/%d/%d)",
-                 I2C_BUS, MUX_I2C_ADDR, GPIO_SEL_A, GPIO_SEL_B, GPIO_SEL_OE)
+        LOG.info("mux ready (bus=%d addr=0x%02X, GPIO %d/%d/%d, settle %.0f/%.0f ms)",
+                 I2C_BUS, MUX_I2C_ADDR, GPIO_SEL_A, GPIO_SEL_B, GPIO_SEL_OE,
+                 gpio_settle_s * 1000, mux_settle_s * 1000)
 
     def _apply_gpio(self, cam):
         sel_a, sel_b, oe = MUX_GPIO_STATES[cam]
@@ -176,14 +186,14 @@ class MuxController:
         self.current = -1
 
         self._apply_gpio(cam)
-        time.sleep(GPIO_SETTLE_S)
+        time.sleep(self.gpio_settle_s)
 
         last_exc = None
         for attempt in range(1, retries + 1):
             try:
                 self._bus.write_byte_data(MUX_I2C_ADDR, MUX_I2C_REG,
                                           MUX_I2C_VALUES[cam])
-                time.sleep(MUX_SETTLE_S)
+                time.sleep(self.mux_settle_s)
                 self.current = cam
                 LOG.debug("mux: selected cam %d", cam)
                 return
@@ -224,22 +234,26 @@ class CameraEngine:
     than a full reconfigure.
     """
 
-    def __init__(self, preview_mode, rotate=0):
+    def __init__(self, preview_mode, rotate=0, pin_raw=False,
+                 gpio_settle_s=DEFAULT_GPIO_SETTLE_MS / 1000.0,
+                 mux_settle_s=DEFAULT_MUX_SETTLE_MS / 1000.0):
         self.preview_mode = preview_mode
         # The cameras are mounted upside down in the case, so 180 is the
         # normal setting. The IMX219 flips in the sensor itself (free);
         # software rotation is only a fallback if libcamera refuses.
         self._hw_rotate = rotate == 180 and Transform is not None
         self._sw_rotate = rotate == 180 and Transform is None
-        self.mux = MuxController()
+        self.mux = MuxController(gpio_settle_s, mux_settle_s)
         self.mux.select(0)
         self.picam2 = Picamera2()
         self._running_kind = None   # None | "preview" | "still"
-        # Pin the raw stream to the still sensor mode so the viewfinder shows
-        # the same field of view as the photos (otherwise libcamera picks the
-        # full-FoV binned mode for the small preview stream). Dropped
-        # automatically if buffer allocation can't afford it.
-        self._pin_raw = True
+        # Pinning the raw stream to the still sensor mode makes the viewfinder
+        # show the same field of view as the photos — but it forces a slow
+        # full-resolution readout for every preview frame, which is the single
+        # biggest brake on preview rate. Off by default: previews now run
+        # whatever fast (usually binned) mode libcamera picks for them, at the
+        # cost of a wider field of view than the stills. --pin-raw restores it.
+        self._pin_raw = pin_raw
         self._cfg_cache = {}
         self._locked = None      # AE/AWB controls held for the current burst
         self._burst = False      # burst is keeping the stream running
@@ -441,6 +455,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--preview-mode", choices=("fast", "safe"), default="fast")
     parser.add_argument("--rotate", type=int, choices=(0, 180), default=0)
+    parser.add_argument("--gpio-settle", type=float,
+                        default=DEFAULT_GPIO_SETTLE_MS,
+                        help="ms after moving the select GPIOs")
+    parser.add_argument("--mux-settle", type=float,
+                        default=DEFAULT_MUX_SETTLE_MS,
+                        help="ms after the mux I2C write")
+    parser.add_argument("--pin-raw", action="store_true",
+                        help="match viewfinder field of view to the stills, "
+                             "at the cost of preview rate")
     args = parser.parse_args()
 
     # Ctrl-C and terminal hangups signal the whole process group; shutdown is
@@ -451,10 +474,13 @@ def main():
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                         format="%(name)s %(levelname)s %(message)s")
 
-    LOG.info("starting (pid=%d, preview_mode=%s, rotate=%d)",
-             os.getpid(), args.preview_mode, args.rotate)
+    LOG.info("starting (pid=%d, preview_mode=%s, rotate=%d, pin_raw=%s)",
+             os.getpid(), args.preview_mode, args.rotate, args.pin_raw)
     try:
-        engine = CameraEngine(args.preview_mode, args.rotate)
+        engine = CameraEngine(args.preview_mode, args.rotate,
+                              pin_raw=args.pin_raw,
+                              gpio_settle_s=args.gpio_settle / 1000.0,
+                              mux_settle_s=args.mux_settle / 1000.0)
     except Exception as exc:
         LOG.error("startup failed: %s", exc, exc_info=True)
         try:
