@@ -43,17 +43,19 @@ TEXT_FLASH = (255, 230, 80)
 
 
 class DisplayManager:
-    def __init__(self, num_cams, windowed=False):
+    def __init__(self, cams, windowed=False):
         pygame.display.init()
         pygame.font.init()
         flags = 0 if windowed else pygame.FULLSCREEN
         self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
         pygame.display.set_caption("wigglecam")
         pygame.mouse.set_visible(False)
-        self.num_cams = num_cams
+        # Port indices in use, 0-3 == A-D; tile N shows self.cams[N], which is
+        # not the same thing as camera N once a port is skipped.
+        self.cams = list(cams)
         self.font = pygame.font.Font(None, 24)
         self.font_big = pygame.font.Font(None, 44)
-        self.tiles, self.info_rect = self._layout(num_cams)
+        self.tiles, self.info_rect = self._layout(len(self.cams))
         self._tile_cache = {}          # cam -> (seq, scaled surface)
         self.status_msg = ""
         self.status_until = 0.0
@@ -118,7 +120,7 @@ class DisplayManager:
         if view == "live":
             self._draw_live(frames, health, live_cam)
         else:
-            for cam, rect in enumerate(self.tiles):
+            for cam, rect in zip(self.cams, self.tiles):
                 label_pos = None
                 if rect.topleft == (0, 0):   # make room for the button
                     label_pos = (SHUTTER_CENTER[0] + SHUTTER_R + 10, rect.y + 4)
@@ -235,9 +237,9 @@ class DisplayManager:
         if time.time() < self.status_until and self.status_msg:
             self._text(self.status_msg, TEXT, topleft=(8, bar.y + 6))
         x = SCREEN_W - 8
-        for cam in range(self.num_cams - 1, -1, -1):
+        for cam in reversed(self.cams):
             ok = health.get(cam, "alive") == "alive"
-            surf = self.font.render(str(cam + 1), True,
+            surf = self.font.render(PORT_LETTERS[cam], True,
                                     TEXT_OK if ok else TEXT_BAD)
             x -= surf.get_width() + 8
             self.screen.blit(surf, (x, bar.y + 6))

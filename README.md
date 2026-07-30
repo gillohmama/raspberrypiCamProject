@@ -10,12 +10,20 @@ on newer releases). Python 3.9, pygame 1.9.6, apt-installed picamera2.
 
 ```
 sudo python3 wigglecam.py              # two cameras, grid view (the default)
+sudo python3 wigglecam.py --cameras A,C   # these two ports specifically
 sudo python3 wigglecam.py 4            # all four ports
 sudo python3 wigglecam.py --view live  # one camera, full screen
 sudo python3 wigglecam.py --preview-mode safe
 sudo python3 wigglecam.py --rotate 0   # cameras mounted the right way up
 sudo python3 wigglecam.py --mux-settle 100 --gpio-settle 50   # back off the timing
 ```
+
+The bare number counts ports from A, so `2` means A and B. When the ports you
+are actually using are not the first N — a dead port B, say — name them with
+`--cameras A,C` (or `--cameras 1,3`). Everything downstream works on port
+indices, so a gap is not a special case: the grid draws two tiles labelled A
+and C, the status bar shows those two letters, and tapping cycles between
+them.
 
 The cameras sit upside down in the case, so images are rotated 180° by
 default — the IMX219 does this in the sensor, at no cost. `--rotate 0`

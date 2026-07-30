@@ -226,27 +226,29 @@ class WorkerLink:
 class CameraService(threading.Thread):
     """Preview pump, capture sequencer and camera health tracker."""
 
-    def __init__(self, num_cams, preview_mode, pics_dir, events, view="grid",
+    def __init__(self, cams, preview_mode, pics_dir, events, view="grid",
                  rotate=0, tuning=None):
         super().__init__(daemon=True, name="camera-service")
-        self.num_cams = num_cams
+        # Port indices actually in use, 0-3 == A-D. Not necessarily
+        # contiguous: a rig with a dead port B runs [0, 2].
+        self.cams = list(cams)
         self.pics_dir = pics_dir
         self.events = events              # shared queue.Queue to the UI
         self.link = WorkerLink(preview_mode, rotate, tuning)
         self.capturing = False
         # "live": stream one camera and nothing else, so the mux never moves
         # between frames and the viewfinder is genuinely real-time.
-        # "grid": round-robin everything (a mux switch per frame, ~1 Hz/cam).
+        # "grid": round-robin everything (a mux switch per frame).
         self.view = view
-        self.live_cam = 0
+        self.live_cam = self.cams[0]
         self.health = {c: {"state": "alive", "timeouts": 0, "soft": 0,
-                           "last_retry": 0.0} for c in range(num_cams)}
+                           "last_retry": 0.0} for c in self.cams}
         self._frames = {}                 # cam -> (seq, w, h, rgb_bytes)
         self._frames_lock = threading.Lock()
         self._seq = 0
         self._ctrl = queue.Queue()
         self._running = True
-        self._rr = num_cams - 1           # round-robin pointer, pre-advanced
+        self._rr = len(self.cams) - 1     # round-robin pointer, pre-advanced
         self._spawn_fails = 0
         self._fast_strikes = []
         self._service_errors = 0
@@ -265,7 +267,7 @@ class CameraService(threading.Thread):
             return dict(self._frames)
 
     def get_health(self):
-        return {c: self.health[c]["state"] for c in range(self.num_cams)}
+        return {c: self.health[c]["state"] for c in self.cams}
 
     def request_capture(self):
         if self.capturing:
@@ -284,7 +286,7 @@ class CameraService(threading.Thread):
         LOG_SVC.debug("view -> %s", view)
 
     def set_live_cam(self, cam):
-        if not 0 <= cam < self.num_cams or cam == self.live_cam:
+        if cam not in self.cams or cam == self.live_cam:
             return
         if self.health[cam]["state"] != "alive":
             self.events.put(("status", "Camera %d is offline" % (cam + 1)))
@@ -296,8 +298,7 @@ class CameraService(threading.Thread):
     def next_live_cam(self):
         """Advance to the next healthy camera — the touch equivalent of 1-4,
         and the replacement for tapping a thumbnail."""
-        alive = [c for c in range(self.num_cams)
-                 if self.health[c]["state"] == "alive"]
+        alive = [c for c in self.cams if self.health[c]["state"] == "alive"]
         if len(alive) < 2:
             self.events.put(("status", "No other camera is online"))
             return
@@ -347,21 +348,22 @@ class CameraService(threading.Thread):
 
     def _pick_cam(self):
         now = time.monotonic()
-        for c in range(self.num_cams):
+        for c in self.cams:
             h = self.health[c]
             if h["state"] == "dead" and now - h["last_retry"] >= DEAD_RETRY_INTERVAL_S:
                 h["last_retry"] = now
                 LOG_SVC.debug("retrying offline camera %d", c + 1)
                 return c
-        alive = [c for c in range(self.num_cams)
-                 if self.health[c]["state"] == "alive"]
+        alive = [c for c in self.cams if self.health[c]["state"] == "alive"]
         if not alive:
             return None
         if self.view != "live":
-            for _ in range(self.num_cams):
-                self._rr = (self._rr + 1) % self.num_cams
-                if self.health[self._rr]["state"] == "alive":
-                    return self._rr
+            # _rr indexes self.cams, not the port number — the two differ as
+            # soon as a port is skipped.
+            for _ in range(len(self.cams)):
+                self._rr = (self._rr + 1) % len(self.cams)
+                if self.health[self.cams[self._rr]]["state"] == "alive":
+                    return self.cams[self._rr]
             return None
         # Live view: only ever the live camera. Sampling the others in the
         # background cost two mux switches and a visible stall each time, to
@@ -569,7 +571,7 @@ class CameraService(threading.Thread):
         try:
             started = time.monotonic()
             timestamp = time.strftime("%Y%m%d-%H%M%S")
-            targets = [c for c in range(self.num_cams)
+            targets = [c for c in self.cams
                        if self.health[c]["state"] == "alive"]
             LOG_SVC.info("capture started (cameras %s)",
                          ", ".join(str(c + 1) for c in targets))

@@ -129,6 +129,32 @@ def self_restart(reason):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def parse_cameras(spec):
+    """"A,C" or "1,3" -> [0, 2]. Ports need not be contiguous: a rig with a
+    dead port B is a perfectly good two-camera rig on A and C."""
+    cams = []
+    for token in spec.replace(" ", "").split(","):
+        if not token:
+            continue
+        name = token.upper()
+        if len(name) == 1 and name in ui.PORT_LETTERS:
+            index = ui.PORT_LETTERS.index(name)
+        elif name.isdigit() and 1 <= int(name) <= len(ui.PORT_LETTERS):
+            index = int(name) - 1
+        else:
+            raise argparse.ArgumentTypeError(
+                "%r is not a camera port — use letters A-D or numbers 1-4"
+                % token)
+        if index in cams:
+            raise argparse.ArgumentTypeError("port %s listed twice"
+                                             % ui.PORT_LETTERS[index])
+        cams.append(index)
+    if len(cams) < 2:
+        raise argparse.ArgumentTypeError(
+            "a wigglegram needs at least two cameras")
+    return cams
+
+
 class App:
     MODE_LIVE = "live"
     MODE_GALLERY = "gallery"
@@ -137,8 +163,8 @@ class App:
         self.events = queue.Queue()
         self.pics_dir = resolve_pics_dir(args.pics_dir)
         self.view = args.view
-        self.display = ui.DisplayManager(args.num_cams, windowed=args.windowed)
-        self.service = CameraService(args.num_cams, args.preview_mode,
+        self.display = ui.DisplayManager(args.cams, windowed=args.windowed)
+        self.service = CameraService(args.cams, args.preview_mode,
                                      self.pics_dir, self.events,
                                      view=args.view, rotate=args.rotate,
                                      tuning={"gpio_settle_ms": args.gpio_settle,
@@ -371,7 +397,13 @@ def main():
     parser = argparse.ArgumentParser(description="Wigglegram camera")
     parser.add_argument("num_cams", nargs="?", type=int, default=2,
                         choices=(2, 3, 4),
-                        help="how many cameras are connected (ports A, B, …)")
+                        help="how many cameras are connected, counting from "
+                             "port A (2 = A and B). Use --cameras when the "
+                             "ports you are using are not the first N.")
+    parser.add_argument("--cameras", type=parse_cameras, default=None,
+                        metavar="PORTS",
+                        help="exactly which ports to use, e.g. 'A,C' or "
+                             "'1,3' — overrides the count")
     parser.add_argument("--preview-mode", choices=("fast", "safe"),
                         default="fast",
                         help="fast keeps the stream running across mux "
@@ -410,9 +442,12 @@ def main():
     # hangs us up mid-startup. We have no terminal worth dying for.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
+    args.cams = args.cameras or list(range(args.num_cams))
+
     setup_logging(args.verbose)
-    LOG.info("starting — %d cameras, %s preview, %s view, rotated %d°",
-             args.num_cams, args.preview_mode, args.view, args.rotate)
+    LOG.info("starting — cameras on ports %s, %s preview, %s view, rotated %d°",
+             "/".join(ui.PORT_LETTERS[c] for c in args.cams),
+             args.preview_mode, args.view, args.rotate)
     LOG.debug("argv=%s", sys.argv)
 
     app = None
