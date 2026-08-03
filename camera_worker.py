@@ -85,15 +85,28 @@ PIXEL_FORMAT = "BGR888"
 # Native size of the screen's viewfinder area, so the fullscreen live view
 # needs no upscaling. ~1.1 MB per frame over the pipe — trivial.
 PREVIEW_SIZE = (800, 450)
-STILL_SIZE = (1920, 1080)
+# IMX708 can read out 4608x2592, but every millisecond of readout widens the
+# gap between the first and last frame of a wigglegram, and the finished GIF
+# is 800 px wide either way. 2304x1296 is that sensor's fast full-field mode
+# and still leaves room to crop; --still-size takes the full frame if the
+# individual JPEGs matter more than how close together they were taken.
+DEFAULT_STILL_SIZE = (2304, 1296)
+
+# libcamera AfModeEnum. Named here rather than imported because the enum
+# moved around between libcamera versions; the integers did not.
+AF_MODE_MANUAL = 0
+AF_MODE_CONTINUOUS = 2
 
 AE_SETTLE_PREVIEW_S = 0.30   # exposure convergence before a preview grab
 AE_SETTLE_STILL_S = 0.40     # a bit longer before a keeper
 FAST_FLUSH_FRAMES = 2        # frames in flight during a live mux switch
 
-# Read off the first camera of a burst and forced on the rest, so the four
-# frames of a wigglegram match instead of each metering for itself.
-BURST_LOCK_KEYS = ("ExposureTime", "AnalogueGain", "ColourGains")
+# Read off the first camera of a burst and forced on the rest, so the frames
+# of a wigglegram match instead of each metering and focusing for itself.
+# LensPosition only exists on a sensor with a lens motor (Camera Module 3);
+# it is skipped when the metadata does not carry it.
+BURST_LOCK_KEYS = ("ExposureTime", "AnalogueGain", "ColourGains",
+                   "LensPosition")
 
 BUS_CLEAR_COOLDOWN_S = 10.0
 _last_bus_clear = 0.0
@@ -236,8 +249,11 @@ class CameraEngine:
 
     def __init__(self, preview_mode, rotate=0, pin_raw=False,
                  gpio_settle_s=DEFAULT_GPIO_SETTLE_MS / 1000.0,
-                 mux_settle_s=DEFAULT_MUX_SETTLE_MS / 1000.0):
+                 mux_settle_s=DEFAULT_MUX_SETTLE_MS / 1000.0,
+                 still_size=DEFAULT_STILL_SIZE, focus="auto"):
         self.preview_mode = preview_mode
+        self.still_size = still_size
+        self.focus = focus
         # The cameras are mounted upside down in the case, so 180 is the
         # normal setting. The IMX219 flips in the sensor itself (free);
         # software rotation is only a fallback if libcamera refuses.
@@ -255,22 +271,31 @@ class CameraEngine:
         # cost of a wider field of view than the stills. --pin-raw restores it.
         self._pin_raw = pin_raw
         self._cfg_cache = {}
-        self._locked = None      # AE/AWB controls held for the current burst
+        self._locked = None      # AE/AWB/focus held for the current burst
         self._burst = False      # burst is keeping the stream running
-        LOG.info("camera engine ready (preview_mode=%s, rotate=%d%s)",
+        # Only Camera Module 3 and friends have a lens motor; asking an
+        # IMX219 for AfMode raises, so every focus control is gated on this.
+        self._has_af = "AfMode" in getattr(self.picam2, "camera_controls", {})
+        if focus != "auto" and not self._has_af:
+            LOG.warning("--focus %s ignored: this sensor has no focus motor",
+                        focus)
+        LOG.info("camera engine ready (preview_mode=%s, rotate=%d%s, "
+                 "stills %dx%d, focus %s)",
                  preview_mode, rotate,
-                 ", in software" if self._sw_rotate else "")
+                 ", in software" if self._sw_rotate else "",
+                 still_size[0], still_size[1],
+                 focus if self._has_af else "fixed (no motor)")
 
     def _config(self, kind, pin_raw, hw_rotate):
         key = (kind, pin_raw, hw_rotate)
         if key not in self._cfg_cache:
-            main = {"size": PREVIEW_SIZE if kind == "preview" else STILL_SIZE,
+            main = {"size": PREVIEW_SIZE if kind == "preview" else self.still_size,
                     "format": PIXEL_FORMAT}
             make = (self.picam2.create_video_configuration if kind == "preview"
                     else self.picam2.create_still_configuration)
             kwargs = {"main": main}
             if pin_raw:
-                kwargs["raw"] = {"size": STILL_SIZE}
+                kwargs["raw"] = {"size": self.still_size}
             if hw_rotate:
                 # 180 deg == both flips; the sensor does it while reading out.
                 kwargs["transform"] = Transform(hflip=1, vflip=1)
@@ -305,12 +330,24 @@ class CameraEngine:
         # re-serialises it in C order, so the view is safe to return.
         return arr[::-1, ::-1] if self._sw_rotate else arr
 
-    def _apply_locked(self):
-        """Re-assert the burst's exposure lock. Necessary after every
-        configure(): picamera2 rebuilds its control set from the camera
-        configuration, dropping anything set earlier."""
-        if self._locked:
-            self.picam2.set_controls(self._locked)
+    def _focus_controls(self):
+        """How the lens should behave outside a burst. Empty on a sensor with
+        no motor, where any AfMode would be rejected."""
+        if not self._has_af:
+            return {}
+        if self.focus == "auto":
+            return {"AfMode": AF_MODE_CONTINUOUS}
+        return {"AfMode": AF_MODE_MANUAL, "LensPosition": float(self.focus)}
+
+    def _apply_controls(self):
+        """Re-assert exposure and focus. Necessary after every configure():
+        picamera2 rebuilds its control set from the camera configuration,
+        dropping anything set earlier. During a burst the locked values win —
+        applying the free-running focus mode on top would let the lens move
+        between frames, which is the thing the lock exists to prevent."""
+        controls = self._locked if self._locked else self._focus_controls()
+        if controls:
+            self.picam2.set_controls(controls)
 
     def _stop_if_running(self):
         if self._running_kind is not None:
@@ -331,6 +368,7 @@ class CameraEngine:
         self._stop_if_running()
         self.mux.select(cam)
         self._configure("preview")
+        self._apply_controls()
         self.picam2.start()
         self._running_kind = "preview"
         time.sleep(AE_SETTLE_PREVIEW_S)
@@ -343,6 +381,7 @@ class CameraEngine:
             self._stop_if_running()
             self.mux.select(cam)
             self._configure("preview")
+            self._apply_controls()
             self.picam2.start()
             self._running_kind = "preview"
             time.sleep(AE_SETTLE_PREVIEW_S)
@@ -374,6 +413,7 @@ class CameraEngine:
         self._stop_if_running()
         self.mux.select(cam)
         self._configure("still")
+        self._apply_controls()              # free-running AE/AWB/AF, for now
         self.picam2.start()
         self._running_kind = "still"
         time.sleep(AE_SETTLE_STILL_S)
@@ -384,6 +424,10 @@ class CameraEngine:
         for key in BURST_LOCK_KEYS:
             if metadata.get(key) is not None:
                 locked[key] = metadata[key]
+        if self._has_af and "LensPosition" in locked:
+            # Holding a position means taking the lens off autofocus, or the
+            # algorithm will simply drive it somewhere else on the next frame.
+            locked["AfMode"] = AF_MODE_MANUAL
         self.picam2.set_controls(locked)
         self._locked = locked
         self._burst = bool(stream) and self.preview_mode == "fast"
@@ -401,10 +445,13 @@ class CameraEngine:
         self._locked = None
         self._stop_if_running()
         if active:
-            # configure() would clear these anyway, but an AeEnable=False left
-            # behind would freeze the viewfinder at the burst's exposure.
-            self.picam2.set_controls({"AeEnable": True, "AwbEnable": True})
-            LOG.debug("burst ended, metering unlocked")
+            # configure() would clear these anyway, but an AeEnable=False or a
+            # parked lens left behind would freeze the viewfinder at the
+            # burst's exposure and focus.
+            restore = {"AeEnable": True, "AwbEnable": True}
+            restore.update(self._focus_controls())
+            self.picam2.set_controls(restore)
+            LOG.debug("burst ended, metering and focus unlocked")
 
     def still(self, cam):
         if self._burst and self._running_kind == "still":
@@ -425,7 +472,7 @@ class CameraEngine:
         self._stop_if_running()
         self.mux.select(cam)
         self._configure("still")
-        self._apply_locked()
+        self._apply_controls()
         self.picam2.start()
         self._running_kind = "still"
         if self._locked is None:
@@ -439,6 +486,18 @@ class CameraEngine:
         self._stop_if_running()
         self.picam2.close()
         self.mux.close()
+
+
+def parse_size(spec):
+    """"2304x1296" -> (2304, 1296)."""
+    try:
+        width, height = (int(part) for part in str(spec).lower().split("x"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expected WIDTHxHEIGHT, e.g. 2304x1296, not %r" % spec)
+    if width < 64 or height < 64:
+        raise argparse.ArgumentTypeError("%r is implausibly small" % spec)
+    return width, height
 
 
 def send(obj, payload=b""):
@@ -464,6 +523,10 @@ def main():
     parser.add_argument("--pin-raw", action="store_true",
                         help="match viewfinder field of view to the stills, "
                              "at the cost of preview rate")
+    parser.add_argument("--still-size", type=parse_size,
+                        default=DEFAULT_STILL_SIZE, help="WIDTHxHEIGHT")
+    parser.add_argument("--focus", default="auto",
+                        help="'auto', or a fixed lens position in dioptres")
     args = parser.parse_args()
 
     # Ctrl-C and terminal hangups signal the whole process group; shutdown is
@@ -480,7 +543,9 @@ def main():
         engine = CameraEngine(args.preview_mode, args.rotate,
                               pin_raw=args.pin_raw,
                               gpio_settle_s=args.gpio_settle / 1000.0,
-                              mux_settle_s=args.mux_settle / 1000.0)
+                              mux_settle_s=args.mux_settle / 1000.0,
+                              still_size=args.still_size,
+                              focus=args.focus)
     except Exception as exc:
         LOG.error("startup failed: %s", exc, exc_info=True)
         try:

@@ -155,6 +155,29 @@ def parse_cameras(spec):
     return cams
 
 
+def valid_size(spec):
+    """Validate WIDTHxHEIGHT here so a typo fails at the prompt rather than
+    three worker respawns later. The worker parses it again for real."""
+    parts = str(spec).lower().split("x")
+    if len(parts) != 2 or not all(p.isdigit() and int(p) >= 64 for p in parts):
+        raise argparse.ArgumentTypeError(
+            "expected WIDTHxHEIGHT, e.g. 4608x2592, not %r" % spec)
+    return "%dx%d" % (int(parts[0]), int(parts[1]))
+
+
+def valid_focus(spec):
+    if str(spec).lower() == "auto":
+        return "auto"
+    try:
+        dioptres = float(spec)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expected 'auto' or a lens position in dioptres, not %r" % spec)
+    if dioptres < 0:
+        raise argparse.ArgumentTypeError("lens position cannot be negative")
+    return str(dioptres)
+
+
 class App:
     MODE_LIVE = "live"
     MODE_GALLERY = "gallery"
@@ -169,13 +192,20 @@ class App:
                                      view=args.view, rotate=args.rotate,
                                      tuning={"gpio_settle_ms": args.gpio_settle,
                                              "mux_settle_ms": args.mux_settle,
-                                             "pin_raw": args.pin_raw})
+                                             "pin_raw": args.pin_raw,
+                                             "still_size": args.still_size,
+                                             "focus": args.focus})
         self.buttons = PiSugarButtons(self.events)
         self.mode = self.MODE_LIVE
         self.gifs = []               # gallery contents, newest first
         self.gif_idx = 0
         self.running = True
         self.fatal_reason = None
+        # Set by SIGUSR1 and acted on by the main loop rather than in the
+        # handler, so a shot can be fired over SSH. The on-screen button and
+        # SPACE both go through pygame, which reads /dev/input directly and
+        # so never sees anything typed into a VNC session.
+        self.shutter_requested = False
         # touch state for the on-screen button and swipes
         self._btn_held = False
         self._hold_done = False
@@ -196,6 +226,10 @@ class App:
             for event in pygame.event.get():
                 self._handle_pygame_event(event)
             self._drain_events()
+            if self.shutter_requested:
+                self.shutter_requested = False
+                LOG.info("shutter fired by SIGUSR1")
+                self._shutter()
             hold = self._update_hold()
             if self.fatal_reason:
                 break
@@ -395,7 +429,7 @@ class App:
 
 def main():
     parser = argparse.ArgumentParser(description="Wigglegram camera")
-    parser.add_argument("num_cams", nargs="?", type=int, default=2,
+    parser.add_argument("num_cams", nargs="?", type=int, default=4,
                         choices=(2, 3, 4),
                         help="how many cameras are connected, counting from "
                              "port A (2 = A and B). Use --cameras when the "
@@ -429,7 +463,18 @@ def main():
                              "reports frontend timeouts)")
     parser.add_argument("--pin-raw", action="store_true",
                         help="make the viewfinder field of view match the "
-                             "stills; costs a lot of preview rate")
+                             "stills; costs preview rate on IMX708")
+    parser.add_argument("--still-size", type=valid_size, default=None,
+                        metavar="WxH",
+                        help="photo resolution, e.g. 4608x2592 for a full "
+                             "IMX708 frame (worker default 2304x1296, which "
+                             "reads out four times faster and so keeps the "
+                             "frames of a wigglegram closer together)")
+    parser.add_argument("--focus", type=valid_focus, default=None,
+                        help="'auto' (the default) autofocuses in the "
+                             "viewfinder and freezes for the capture; give a "
+                             "number instead to fix the lens, in dioptres "
+                             "(0 = infinity, 3.3 ≈ 30 cm)")
     parser.add_argument("--windowed", action="store_true",
                         help="don't go fullscreen (development)")
     parser.add_argument("--verbose", action="store_true",
@@ -458,6 +503,9 @@ def main():
         # Ctrl-C exits cleanly (workers, pygame and all) within a second or two.
         signal.signal(signal.SIGINT, lambda *_: setattr(app, "running", False))
         signal.signal(signal.SIGTERM, lambda *_: setattr(app, "running", False))
+        # sudo pkill -USR1 -f wigglecam.py  — shoot without the touchscreen.
+        signal.signal(signal.SIGUSR1,
+                      lambda *_: setattr(app, "shutter_requested", True))
         fatal = app.run()
     except KeyboardInterrupt:
         LOG.info("KeyboardInterrupt")

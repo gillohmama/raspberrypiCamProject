@@ -91,6 +91,10 @@ class WorkerLink:
             argv += ["--mux-settle", str(self.tuning["mux_settle_ms"])]
         if self.tuning.get("pin_raw"):
             argv.append("--pin-raw")
+        if self.tuning.get("still_size") is not None:
+            argv += ["--still-size", self.tuning["still_size"]]
+        if self.tuning.get("focus") is not None:
+            argv += ["--focus", str(self.tuning["focus"])]
         return argv
 
     def start(self):

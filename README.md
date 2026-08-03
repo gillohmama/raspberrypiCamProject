@@ -1,9 +1,12 @@
 # Wigglegram Camera
 
 A self-contained handheld wigglegram camera: a Raspberry Pi 4 with an Arducam
-Multi Camera Adapter V2.2 (2–4× IMX219, one CSI port, muxed), a FREENOVE
+Multi Camera Adapter V2.2 (2–4 cameras, one CSI port, muxed), a FREENOVE
 800×480 touchscreen as the viewfinder, and a PiSugar 3 Plus button as the
 shutter. Shoot a burst across the cameras, get a bouncing 3D GIF.
+
+Currently running 4× Raspberry Pi Camera Module 3 (IMX708, 12MP, autofocus).
+IMX219 works too; the two cannot be mixed.
 
 Runs on **Raspberry Pi OS Bullseye only** (the Arducam adapter does not work
 on newer releases). Python 3.9, pygame 1.9.6, apt-installed picamera2.
@@ -40,6 +43,7 @@ button (now a back arrow) returns to the camera.
 | Action                  | PiSugar button | Keyboard | Touch |
 |-------------------------|----------------|----------|-------|
 | Capture wigglegram      | single tap     | SPACE    | tap the button |
+| Capture, from a terminal | — | `pkill -USR1 -f wigglecam.py` | — |
 | Open gallery            | double tap     | G        | hold the button ~1 s |
 | (gallery) older / newer | —              | → / ←    | swipe left / right |
 | (gallery) slower/faster | —              | - / +    | tap left / right half |
@@ -51,6 +55,11 @@ button (now a back arrow) returns to the camera.
 
 Photos and GIFs land in `~/piCameraPics` (the invoking user's home, not
 root's) as `<timestamp>_cam<N>.jpg` + `<timestamp>_wigglegram.gif`.
+
+pygame here draws to the framebuffer and reads `/dev/input` directly, so
+neither the keyboard nor the on-screen button works over VNC — VNC delivers
+input to the X session, which the app is not using. Hence the signal: from an
+SSH shell, `sudo pkill -USR1 -f wigglecam.py` fires the shutter.
 
 ## Architecture
 
@@ -141,8 +150,14 @@ bracketed by `burst_begin` / `burst_end`:
   AE settled on, and forced on the rest. Without this each sensor meters
   for itself and the finished loop flickers in brightness and colour —
   the most visible artefact in a wigglegram, and not something the GIF
-  encoder can fix afterwards. All four are IMX219 in the same sensor mode,
-  so the values transfer exactly.
+  encoder can fix afterwards. Every camera is the same model in the same
+  sensor mode, so the values transfer exactly.
+- **Focus is locked with it**, on a sensor that has a lens motor. Camera
+  Module 3 autofocuses in the viewfinder and then holds whatever the first
+  camera settled on for the rest of the burst — two cameras focusing
+  independently give you two frames at different focus distances, which reads
+  worse in a wigglegram than either being slightly soft. `--focus 3.3` fixes
+  the lens outright (dioptres; 0 is infinity) if the autofocus hunts.
 - **The AE settle disappears** for every camera after the first (0.4 s
   each), because there is no longer any AE to converge.
 - In fast mode the burst also **keeps the stream running** and switches the
@@ -255,9 +270,20 @@ grep RESTART wigglecam.log                # self-restarts
 ## First-run checklist
 
 1. `./setup.sh` on a fresh Bullseye image, then reboot.
-2. `sudo python3 wigglecam.py 3`.
-3. **Verify colors**: photograph something plainly red; if it comes out blue,
-   the BGR888/RGB888 assumption needs flipping in `camera_worker.py`
-   (`PIXEL_FORMAT`).
-4. Check preview cadence in fast mode; if libcamera logs frontend timeouts,
-   run with `--preview-mode safe`.
+2. Set `/boot/config.txt` to match the sensor you fitted — `camera_auto_detect=0`
+   plus `dtoverlay=imx708` for Camera Module 3, `dtoverlay=imx219` for a v2.
+   Every camera on the mux must be the same model: one driver binds, once, at
+   boot, through whichever port the mux powers up routing (port A).
+3. `libcamera-hello --list-cameras` before running anything. One camera listed
+   is correct — the mux only ever presents one. Nothing listed means the
+   overlay and the hardware disagree; `dmesg | grep -i imx` will say
+   `failed to read chip id ... error -5` when the driver asked and got silence.
+4. `sudo python3 wigglecam.py`.
+5. Check preview cadence in fast mode; if libcamera logs frontend timeouts,
+   run with `--preview-mode safe`, and see the settle notes above before
+   assuming the wiring is at fault.
+
+The colours were wrong for a long time on this rig. That turned out to be
+**NoIR camera modules** — no infrared filter, so daylight comes out washed and
+magenta — and not the `BGR888`/`RGB888` question. If colours look off, check
+which modules are fitted before touching `PIXEL_FORMAT`.
