@@ -28,9 +28,9 @@ indices, so a gap is not a special case: the grid draws two tiles labelled A
 and C, the status bar shows those two letters, and tapping cycles between
 them.
 
-The cameras sit upside down in the case, so images are rotated 180° by
-default — the IMX219 does this in the sensor, at no cost. `--rotate 0`
-turns it off if they are ever remounted.
+The 3D-printed case mounts the cameras the right way up, so no rotation is
+applied by default. `--rotate 180` flips them in the sensor, at no cost, for
+the older case where they hung upside down.
 
 ## Controls
 
@@ -125,14 +125,15 @@ if you want to check every port on purpose.
 
 ### Preview strategies
 
-- **fast** (default): the stream keeps running; the mux is switched live, two
-  stale frames are flushed, the next is used. ~0.3 s per switched frame; in
-  live view (no switching) it's whatever the pipe sustains, ~15–25 fps.
-- **safe**: full stop → switch → configure → start → settle → capture → stop
-  per frame (~0.6 s), the proven-reliable old method.
-
-Three worker deaths while in fast mode auto-demote the session to safe.
-`--preview-mode safe` or the F key force it.
+- **safe** (default): full stop → switch → configure → start → capture → stop
+  per frame. Each camera comes round about once a second with four connected.
+- **fast** (`--preview-mode fast` / F key): the stream keeps running, the mux
+  is switched live, two stale frames are flushed. Quicker in principle —
+  **but it has never survived on this rig.** Every frontend timeout in the
+  logs came from switching the mux under a live stream. It kills the worker,
+  the parent respawns, and after two strikes the session demotes to safe
+  anyway; that cycle used to cost about ninety seconds of thrash at every
+  startup, which is why safe is the default now.
 
 The other brake on preview rate is the raw stream. Pinning it to the still
 sensor mode makes the viewfinder's field of view match the photos, but forces
@@ -188,6 +189,11 @@ number between modes rather than guessing.
 - A wedged I2C bus (everything errno 110) survives reboots; the worker
   recovers it in software: ~10 SCL pulses, a STOP condition, then
   `raspi-gpio set 2/3 a0 pu` to restore ALT0.
+- Single `errno 121` NACKs on the mux write are routine on this rig — the
+  immediate retry almost always succeeds, so they are logged at debug and
+  only a total failure warns. If they get worse, slow the bus down with
+  `dtparam=i2c_arm_baudrate=50000` in `/boot/config.txt`; a marginal I2C run
+  tolerates 50 kHz far better than the default 100 kHz.
 - PiSugar (0x57): prefer the pisugar-server socket, which *pushes*
   `single`/`double`/`long`; without it, poll reg `0x3A` (bit 4 single,
   bit 5 double, clear by writing the value back with the bits masked) at

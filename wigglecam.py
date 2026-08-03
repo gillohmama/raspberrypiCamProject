@@ -439,16 +439,19 @@ def main():
                         help="exactly which ports to use, e.g. 'A,C' or "
                              "'1,3' — overrides the count")
     parser.add_argument("--preview-mode", choices=("fast", "safe"),
-                        default="fast",
-                        help="fast keeps the stream running across mux "
-                             "switches; safe reconfigures per frame")
+                        default="safe",
+                        help="safe (the default) stops and restarts the "
+                             "camera around each mux switch; fast keeps the "
+                             "stream running across them, which is quicker "
+                             "but has never survived on this rig")
     parser.add_argument("--pics-dir", default=None,
                         help="where to save photos and GIFs "
                              "(default: ~/piCameraPics of the sudo user; "
                              "required when started by systemd)")
-    parser.add_argument("--rotate", type=int, choices=(0, 180), default=180,
-                        help="camera image rotation; 180 (the default) suits "
-                             "the upside-down mounting in the case")
+    parser.add_argument("--rotate", type=int, choices=(0, 180), default=0,
+                        help="camera image rotation; the 3D-printed case "
+                             "mounts them the right way up, so 0. The older "
+                             "case needed 180.")
     parser.add_argument("--view", choices=("live", "grid"), default="grid",
                         help="grid (the default) round-robins every camera "
                              "into a full-size tile; live streams one camera "

@@ -79,6 +79,12 @@ MUX_I2C_VALUES = [0x04, 0x05, 0x06, 0x07]
 DEFAULT_GPIO_SETTLE_MS = 5.0
 DEFAULT_MUX_SETTLE_MS = 25.0
 
+# The mux NACKs a write now and then (errno 121) and answers the retry. That
+# is one transaction failing, not the bus being stuck, so the retry should be
+# immediate — sleeping 0.3 s for each one cost more than the switch itself.
+MUX_NACK_RETRY_S = 0.01
+MUX_WEDGED_RETRY_S = 0.3
+
 # libcamera names pixel formats DRM-style: "BGR888" is R,G,B in memory,
 # which is what PIL and pygame expect. ("RGB888" would be B,G,R.)
 PIXEL_FORMAT = "BGR888"
@@ -212,13 +218,21 @@ class MuxController:
                 return
             except OSError as exc:
                 last_exc = exc
-                LOG.warning("mux i2c write for cam %d failed (attempt %d/%d): %s",
-                            cam, attempt, retries, exc)
+                # Debug, not warning: these happen constantly on this rig and
+                # the retry almost always succeeds, so warning on each one
+                # buried the log in noise that needed no action. The warning
+                # below fires only when every attempt failed.
+                LOG.debug("mux i2c write for cam %d failed (attempt %d/%d): %s",
+                          cam, attempt, retries, exc)
                 # errno 110 = the bus itself is wedged; retrying is pointless
                 # until it has been cleared
                 if getattr(exc, "errno", None) == 110:
                     clear_i2c_bus()
-                time.sleep(0.3)
+                    time.sleep(MUX_WEDGED_RETRY_S)
+                else:
+                    time.sleep(MUX_NACK_RETRY_S)
+        LOG.warning("mux i2c write for cam %d failed on all %d attempts: %s",
+                    cam, retries, last_exc)
         raise last_exc
 
     def close(self):
@@ -512,7 +526,7 @@ def send(obj, payload=b""):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--preview-mode", choices=("fast", "safe"), default="fast")
+    parser.add_argument("--preview-mode", choices=("fast", "safe"), default="safe")
     parser.add_argument("--rotate", type=int, choices=(0, 180), default=0)
     parser.add_argument("--gpio-settle", type=float,
                         default=DEFAULT_GPIO_SETTLE_MS,
